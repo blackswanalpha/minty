@@ -1,8 +1,13 @@
+
+          ![Minty Logo](public/logo.png)
+
+
+
 # 🍃 Minty Terminal
 
 Minty is a modern, lightweight, and highly customizable terminal emulator built with **Electron**, **React**, and **Vite**. It focuses on speed, aesthetics, and a smooth developer experience.
 
-![Minty Logo](public/logo.png)
+
 
 ## ✨ Features
 
