@@ -1,7 +1,8 @@
+<div align="center">
 
-          ![Minty Logo](public/logo.png)
+![Minty Logo](public/logo.png)
 
-
+</div>
 
 # 🍃 Minty Terminal
 
