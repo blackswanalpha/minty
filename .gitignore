@@ -7,6 +7,8 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+*.tgz
+
 node_modules
 dist
 dist_electron
@@ -24,3 +26,26 @@ dist-ssr
 *.sln
 *.sw?
 ./dist_electron
+./minty-0.1.0.tgz
+./node_modules/electron/dist/electron
+./dist_electron/linux-unpacked/minty
+./dist_electron/Minty-0.1.0.AppImage
+./dist_electron/Minty-0.0.0.AppImage
+./dist_electron/linux-unpacked/resources/app.asar
+./dist_electron/minty_0.1.0_amd64.deb
+./dist_electron/minty_0.1.0_arm64.deb
+./dist_electron/minty_0.1.0_arm64.deb
+./node_modules/app-builder-bin/win/x64/app-builder.exe
+./node_modules/app-builder-bin/win/ia32/app-builder.exe
+./node_modules/app-builder-bin/win/arm64/app-builder.exe
+./node_modules/app-builder-bin/mac/app-builder_arm64
+./node_modules/app-builder-bin/mac/app-builder_amd64
+./node_modules/app-builder-bin/linux/x64/app-builder
+./node_modules/app-builder-bin/linux/riscv64/app-builder
+./node_modules/app-builder-bin/linux/loong64/app-builder
+./node_modules/app-builder-bin/linux/ia32/app-builder
+./node_modules/app-builder-bin/linux/arm/app-builder
+./node_modules/app-builder-bin/linux/arm64/app-builder
+./node_modules/electron/dist/LICENSES.chromium.html
+./dist_electron/linux-unpacked/LICENSES.chromium.html
+./node_modules/@esbuild/linux-x64/bin/esbuild
