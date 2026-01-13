@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Minty
+Comment=Modern Terminal Emulator
+Exec=minty
+Icon=minty
+Type=Application
+Terminal=false
+Categories=Development;System;TerminalEmulator;
+StartupWMClass=Minty
