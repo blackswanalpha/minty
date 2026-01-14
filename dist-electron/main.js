@@ -41,6 +41,10 @@ const node_path_1 = __importDefault(require("node:path"));
 const node_os_1 = __importDefault(require("node:os"));
 const pty = __importStar(require("node-pty"));
 const electron_updater_1 = require("electron-updater");
+const electron_log_1 = __importDefault(require("electron-log"));
+// Configure Logger
+electron_log_1.default.transports.file.level = 'info';
+electron_updater_1.autoUpdater.logger = electron_log_1.default;
 // Track PTY instances and directories per terminal tab
 const tabPtys = new Map();
 const tabDirectories = new Map();
@@ -66,21 +70,27 @@ electron_updater_1.autoUpdater.allowPrerelease = true;
 electron_updater_1.autoUpdater.allowDowngrade = false;
 function setupAutoUpdater(win) {
     electron_updater_1.autoUpdater.on('checking-for-update', () => {
+        electron_log_1.default.info('Checking for update...');
         win.webContents.send('update-checking');
     });
     electron_updater_1.autoUpdater.on('update-available', (info) => {
+        electron_log_1.default.info('Update available:', info);
         win.webContents.send('update-available', info);
     });
     electron_updater_1.autoUpdater.on('update-not-available', (info) => {
+        electron_log_1.default.info('Update not available:', info);
         win.webContents.send('update-not-available', info);
     });
     electron_updater_1.autoUpdater.on('error', (err) => {
+        electron_log_1.default.error('Update error:', err);
         win.webContents.send('update-error', err.message);
     });
     electron_updater_1.autoUpdater.on('download-progress', (progressObj) => {
+        electron_log_1.default.info('Download progress:', progressObj.percent + '%');
         win.webContents.send('download-progress', progressObj);
     });
     electron_updater_1.autoUpdater.on('update-downloaded', (info) => {
+        electron_log_1.default.info('Update downloaded:', info);
         win.webContents.send('update-downloaded', info);
     });
 }

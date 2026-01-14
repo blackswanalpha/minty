@@ -3,6 +3,11 @@ import path from 'node:path'
 import os from 'node:os'
 import * as pty from 'node-pty'
 import { autoUpdater } from 'electron-updater'
+import log from 'electron-log'
+
+// Configure Logger
+log.transports.file.level = 'info';
+autoUpdater.logger = log;
 
 // Track PTY instances and directories per terminal tab
 const tabPtys: Map<string, pty.IPty> = new Map()
@@ -35,26 +40,32 @@ autoUpdater.allowDowngrade = false;
 
 function setupAutoUpdater(win: BrowserWindow) {
     autoUpdater.on('checking-for-update', () => {
+        log.info('Checking for update...');
         win.webContents.send('update-checking');
     });
 
     autoUpdater.on('update-available', (info: any) => {
+        log.info('Update available:', info);
         win.webContents.send('update-available', info);
     });
 
     autoUpdater.on('update-not-available', (info: any) => {
+        log.info('Update not available:', info);
         win.webContents.send('update-not-available', info);
     });
 
     autoUpdater.on('error', (err: Error) => {
+        log.error('Update error:', err);
         win.webContents.send('update-error', err.message);
     });
 
     autoUpdater.on('download-progress', (progressObj: any) => {
+        log.info('Download progress:', progressObj.percent + '%');
         win.webContents.send('download-progress', progressObj);
     });
 
     autoUpdater.on('update-downloaded', (info: any) => {
+        log.info('Update downloaded:', info);
         win.webContents.send('update-downloaded', info);
     });
 }
