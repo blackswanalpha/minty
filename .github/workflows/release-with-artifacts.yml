@@ -13,6 +13,9 @@ on:
         description: 'Name of the release'
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build and Release - ${{ matrix.os }}
@@ -37,7 +40,7 @@ jobs:
 
       - name: Build and Package
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: npm run dist
         # electron-builder handles building for the current OS
 
@@ -59,4 +62,4 @@ jobs:
             dist_electron/latest.yml
           generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
