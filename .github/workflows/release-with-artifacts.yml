@@ -1,0 +1,59 @@
+name: Create Release with Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.2.3)'
+        required: false
+      release_name:
+        description: 'Name of the release'
+        required: false
+
+jobs:
+  build:
+    name: Build and Release - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Build and Package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist
+        # electron-builder handles building for the current OS
+
+      - name: Create Release and Upload Artifacts
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          name: ${{ github.event.inputs.release_name || github.ref_name }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist_electron/*.AppImage
+            dist_electron/*.deb
+            dist_electron/*.exe
+            dist_electron/*.dmg
+            dist_electron/*.zip
+            dist_electron/*.blockmap
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
