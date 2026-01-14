@@ -3,6 +3,8 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { ptyEventManager } from '@/lib/ptyEventManager';
 import { useTerminalStore } from '@/stores/terminalStore';
+import { TerminalContextMenu } from './TerminalContextMenu';
+import { toast } from 'sonner';
 import '@xterm/xterm/css/xterm.css';
 
 interface XTerminalProps {
@@ -15,7 +17,7 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const initializedRef = useRef(false);
-  const { updateTab } = useTerminalStore();
+  const updateTab = useTerminalStore(state => state.updateTab);
 
   // Initialize terminal - only runs once per tabId
   useEffect(() => {
@@ -95,15 +97,25 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
     });
 
     // Handle selection change - manual copy on selection for better UX
+    // Handle selection change - manual copy on selection for better UX
+    // Debounce to prevent race conditions and toast spam
+    let debounceTimer: ReturnType<typeof setTimeout>;
+
     term.onSelectionChange(() => {
-      if (term.hasSelection()) {
-        const selection = term.getSelection();
-        if (selection) {
-          navigator.clipboard.writeText(selection).catch(err => {
-            console.warn('Failed to copy selection:', err);
-          });
+      if (debounceTimer) clearTimeout(debounceTimer);
+
+      debounceTimer = setTimeout(() => {
+        if (term.hasSelection()) {
+          const selection = term.getSelection();
+          if (selection) {
+            navigator.clipboard.writeText(selection).then(() => {
+              toast.success('Copied', { duration: 1000 });
+            }).catch(err => {
+              console.warn('Failed to copy selection:', err);
+            });
+          }
         }
-      }
+      }, 500); // Wait 500ms after selection settles
     });
 
     // Update readiness in store
@@ -111,6 +123,8 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
 
     // Cleanup function - only on unmount (tab close)
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+
       // Unregister from event manager
       ptyEventManager.unregister(tabId);
 
@@ -177,34 +191,57 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
   }, [isActive, tabId]);
 
 
+  const handleNewTab = () => {
+    window.ipcRenderer.invoke('create-new-tab');
+  };
+
+  const handleNewWindow = () => {
+    window.ipcRenderer.invoke('create-new-window');
+  };
+
+  const handleCopy = () => {
+    if (xtermRef.current?.hasSelection()) {
+      const selection = xtermRef.current.getSelection();
+      navigator.clipboard.writeText(selection).then(() => {
+        toast.success('Copied to clipboard');
+      }).catch(err => {
+        console.warn('Failed to copy selection:', err);
+      });
+      xtermRef.current.clearSelection();
+    }
+  };
+
+  const handlePaste = () => {
+    navigator.clipboard.readText().then(text => {
+      if (text) {
+        window.ipcRenderer.invoke('send-input', tabId, text);
+      }
+    }).catch(err => {
+      console.warn('Failed to read clipboard:', err);
+    });
+  };
+
   return (
-    <div
-      ref={terminalRef}
-      className="w-full h-full bg-[#0a0a0a] xterm-container"
-      onContextMenu={() => {
-        // Right click to paste if there's no selection, or just let the default context menu show
-        // For a more native feel, we'll implement a simple one or just handle paste
-        if (xtermRef.current) {
-          if (!xtermRef.current.hasSelection()) {
-            // If no selection, paste on right click (common terminal behavior)
-            navigator.clipboard.readText().then(text => {
-              if (text) {
-                window.ipcRenderer.invoke('send-input', tabId, text);
-              }
-            });
-          }
-        }
-      }}
-      style={{
-        padding: '8px',
-        minHeight: '300px',
-        height: '100%',
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0
-      }}
-    />
+    <TerminalContextMenu
+      onNewTab={handleNewTab}
+      onNewWindow={handleNewWindow}
+      onCopy={handleCopy}
+      onPaste={handlePaste}
+    >
+      <div
+        ref={terminalRef}
+        className="w-full h-full bg-[#0a0a0a] xterm-container"
+        style={{
+          padding: '8px',
+          minHeight: '300px',
+          height: '100%',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0
+        }}
+      />
+    </TerminalContextMenu>
   );
 };

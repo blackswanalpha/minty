@@ -4,13 +4,14 @@
   "version": "0.1.0",
   "description": "Modern Terminal Emulator built with Electron and React",
   "author": "Minty Authors <contact@minty.app>",
-  "homepage": "https://github.com/minty-app/minty",
+  "homepage": "https://github.com/blackswanalpha/minty",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "concurrently \"vite\" \"npm run dev:electron\"",
     "dev:electron": "tsc -p tsconfig.electron.json && electron . --no-sandbox",
     "build": "tsc -b && vite build && tsc -p tsconfig.electron.json",
     "dist": "npm run build && electron-builder",
+    "release": "npm run build && electron-builder --publish always",
     "pack": "npm run build && electron-builder --dir",
     "lint": "eslint .",
     "preview": "vite preview"
@@ -57,7 +58,14 @@
         "dmg"
       ],
       "icon": "build/icon.icns"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "blackswanalpha",
+        "repo": "minty"
+      }
+    ]
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
@@ -97,6 +105,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "date-fns": "^3.6.0",
+    "electron-updater": "^6.7.3",
     "embla-carousel-react": "^8.6.0",
     "gsap": "^3.14.2",
     "input-otp": "^1.4.2",

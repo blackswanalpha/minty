@@ -7,12 +7,15 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 
+import { UpdateStatus } from "@/components/updater/UpdateStatus";
+
 const queryClient = new QueryClient();
 
 const App = () => (
   <ErrorBoundary>
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
+        <UpdateStatus />
         <Toaster />
         <Sonner />
         <HashRouter>
