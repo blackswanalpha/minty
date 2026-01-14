@@ -60,6 +60,10 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 // Configure AutoUpdater
 electron_updater_1.autoUpdater.autoDownload = false;
 electron_updater_1.autoUpdater.autoInstallOnAppQuit = true;
+// Allow pre-releases (e.g. beta, alpha)
+electron_updater_1.autoUpdater.allowPrerelease = true;
+// Useful for development/testing
+electron_updater_1.autoUpdater.allowDowngrade = false;
 function setupAutoUpdater(win) {
     electron_updater_1.autoUpdater.on('checking-for-update', () => {
         win.webContents.send('update-checking');

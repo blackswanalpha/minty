@@ -28,6 +28,10 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 // Configure AutoUpdater
 autoUpdater.autoDownload = false;
 autoUpdater.autoInstallOnAppQuit = true;
+// Allow pre-releases (e.g. beta, alpha)
+autoUpdater.allowPrerelease = true;
+// Useful for development/testing
+autoUpdater.allowDowngrade = false;
 
 function setupAutoUpdater(win: BrowserWindow) {
     autoUpdater.on('checking-for-update', () => {
