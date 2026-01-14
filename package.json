@@ -15,6 +15,8 @@
     "version:patch": "npm version patch",
     "version:minor": "npm version minor",
     "version:major": "npm version major",
+    "tag:create": "npm version patch",
+    "tag:push": "git push --follow-tags origin master",
     "release:push": "git push --follow-tags origin master",
     "pack": "npm run build && electron-builder --dir",
     "lint": "eslint .",
