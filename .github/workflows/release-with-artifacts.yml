@@ -54,6 +54,9 @@ jobs:
             dist_electron/*.dmg
             dist_electron/*.zip
             dist_electron/*.blockmap
+            dist_electron/latest-linux.yml
+            dist_electron/latest-mac.yml
+            dist_electron/latest.yml
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
