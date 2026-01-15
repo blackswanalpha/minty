@@ -18,9 +18,9 @@ permissions:
 
 jobs:
   build:
-    name: Build and Release - ${{ matrix.os }}
+    name: Build - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    
+
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -38,18 +38,67 @@ jobs:
       - name: Install Dependencies
         run: npm ci --legacy-peer-deps
 
-      - name: Build and Publish
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: npm run release
-        # electron-builder handles building and publishing artifacts, including latest-*.yml files
+      - name: Build Electron App
+        run: npm run dist
+        # Build artifacts without publishing - we'll upload them in the release job
 
-      - name: Create Release
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-artifacts
+          path: |
+            dist_electron/*.exe
+            dist_electron/*.dmg
+            dist_electron/*.AppImage
+            dist_electron/*.deb
+            dist_electron/*.yml
+            dist_electron/*.yaml
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Verify critical update files exist
+        run: |
+          echo "Checking for update metadata files..."
+          if ls artifacts/*.yml 1> /dev/null 2>&1; then
+            echo "✓ Found .yml update metadata files:"
+            ls -lh artifacts/*.yml
+          else
+            echo "⚠ Warning: No .yml files found! Auto-updates may not work."
+          fi
+
+          echo ""
+          echo "All artifacts to be uploaded:"
+          find artifacts -type f -exec ls -lh {} \;
+
+      - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           name: ${{ github.event.inputs.release_name || github.ref_name }}
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
+          files: |
+            artifacts/*.exe
+            artifacts/*.dmg
+            artifacts/*.AppImage
+            artifacts/*.deb
+            artifacts/*.yml
+            artifacts/*.yaml
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
