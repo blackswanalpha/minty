@@ -86,21 +86,29 @@ program
 
             for (const filePath of filePaths) {
                 const fullPath = path.join(targetDir, filePath);
-                const stats = await fs.stat(fullPath);
-
-                // Skip large files (> 1MB)
-                if (stats.size > 1024 * 1024) {
-                    console.log(chalk.yellow(`Skipping large file: ${filePath}`));
-                    continue;
-                }
-
-                if (await isBinaryFile(fullPath)) {
-                    console.log(chalk.yellow(`Skipping binary file: ${filePath}`));
-                    continue;
-                }
 
                 try {
+                    const stats = await fs.stat(fullPath);
+
+                    // Skip large files (> 1MB)
+                    if (stats.size > 1024 * 1024) {
+                        console.log(chalk.yellow(`Skipping large file: ${filePath}`));
+                        continue;
+                    }
+
+                    if (await isBinaryFile(fullPath)) {
+                        console.log(chalk.yellow(`Skipping binary file: ${filePath}`));
+                        continue;
+                    }
+
                     const content = await fs.readFile(fullPath, 'utf-8');
+
+                    // Additional check for content size to prevent memory issues
+                    if (content.length > 1024 * 1024) { // 1MB in characters
+                        console.log(chalk.yellow(`Skipping large content file: ${filePath}`));
+                        continue;
+                    }
+
                     const tokens = Math.ceil(content.length / 4); // Rough estimation
                     totalTokens += tokens;
 

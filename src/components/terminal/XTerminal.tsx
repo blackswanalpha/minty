@@ -99,14 +99,17 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
     // Handle selection change - manual copy on selection for better UX
     // Handle selection change - manual copy on selection for better UX
     // Debounce to prevent race conditions and toast spam
-    let debounceTimer: ReturnType<typeof setTimeout>;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     term.onSelectionChange(() => {
-      if (debounceTimer) clearTimeout(debounceTimer);
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
 
       debounceTimer = setTimeout(() => {
-        if (term.hasSelection()) {
-          const selection = term.getSelection();
+        if (xtermRef.current && xtermRef.current.hasSelection()) { // Check if terminal still exists
+          const selection = xtermRef.current.getSelection();
           if (selection) {
             navigator.clipboard.writeText(selection).then(() => {
               toast.success('Copied', { duration: 1000 });
@@ -115,6 +118,7 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
             });
           }
         }
+        debounceTimer = null; // Clear the reference after execution
       }, 500); // Wait 500ms after selection settles
     });
 
@@ -186,6 +190,7 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
       window.removeEventListener('resize', handleResize);
       if (resizeObserver) {
         resizeObserver.disconnect();
+        resizeObserver = null; // Clear reference to prevent memory leaks
       }
     };
   }, [isActive, tabId]);

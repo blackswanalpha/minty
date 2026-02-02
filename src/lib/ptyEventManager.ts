@@ -74,17 +74,21 @@ getRegisteredTabs(): string[] {
 
   // Cleanup method to prevent memory leaks
   cleanup() {
-    if (this.outputListener && typeof window !== 'undefined' && window.ipcRenderer) {
-      window.ipcRenderer.off('pty-output', this.outputListener);
+    try {
+      if (this.outputListener && typeof window !== 'undefined' && window.ipcRenderer) {
+        window.ipcRenderer.off('pty-output', this.outputListener);
+      }
+      if (this.exitListener && typeof window !== 'undefined' && window.ipcRenderer) {
+        window.ipcRenderer.off('pty-exit', this.exitListener);
+      }
+      this.callbacks.clear();
+      this.initialized = false;
+      this.outputListener = null;
+      this.exitListener = null;
+      console.log('[PtyEventManager] Cleaned up all listeners');
+    } catch (error) {
+      console.error('[PtyEventManager] Error during cleanup:', error);
     }
-    if (this.exitListener && typeof window !== 'undefined' && window.ipcRenderer) {
-      window.ipcRenderer.off('pty-exit', this.exitListener);
-    }
-    this.callbacks.clear();
-    this.initialized = false;
-    this.outputListener = null;
-    this.exitListener = null;
-    console.log('[PtyEventManager] Cleaned up all listeners');
   }
 
   }

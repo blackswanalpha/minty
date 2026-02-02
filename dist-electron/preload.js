@@ -47,4 +47,17 @@ electron_1.contextBridge.exposeInMainWorld('ipcRenderer', {
         return electron_1.ipcRenderer.sendSync(channel, ...args);
     }
 });
+// Expose Cache API to renderer process
+electron_1.contextBridge.exposeInMainWorld('cacheApi', {
+    initialize: () => electron_1.ipcRenderer.invoke('cache-initialize'),
+    getState: () => electron_1.ipcRenderer.invoke('cache-get-state'),
+    save: (entry) => electron_1.ipcRenderer.invoke('cache-save', entry),
+    saveForce: (entry) => electron_1.ipcRenderer.invoke('cache-save-force', entry),
+    restore: (windowId) => electron_1.ipcRenderer.invoke('cache-restore', windowId),
+    getSettings: () => electron_1.ipcRenderer.invoke('cache-get-settings'),
+    setSettings: (settings) => electron_1.ipcRenderer.invoke('cache-set-settings', settings),
+    clear: (windowId) => electron_1.ipcRenderer.invoke('cache-clear', windowId),
+    registerTab: (windowId, tabId) => electron_1.ipcRenderer.invoke('cache-register-tab', windowId, tabId),
+    unregisterTab: (windowId, tabId) => electron_1.ipcRenderer.invoke('cache-unregister-tab', windowId, tabId)
+});
 //# sourceMappingURL=preload.js.map

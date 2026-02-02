@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from "react";
+import { useEffect, useCallback, useRef } from "react";
 import { ToolsSidebar } from "@/components/ToolsSidebar";
 import { TerminalHeader } from "@/components/terminal/TerminalHeader";
 import { TerminalStatusBar } from "@/components/terminal/TerminalStatusBar";
@@ -6,6 +6,7 @@ import { TerminalToolbar } from "@/components/terminal/TerminalToolbar";
 import { XTerminal } from "@/components/terminal/XTerminal";
 import { WelcomePage } from "@/components/WelcomePage";
 import { useTerminalStore } from "@/stores/terminalStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { useDirectorySync } from "@/hooks/useDirectorySync";
 
 
@@ -22,6 +23,39 @@ const Index = () => {
   const activeTab = useTerminalStore(state =>
     state.tabs.find(t => t.id === state.activeTabId)
   );
+
+  const restoreAttempted = useRef(false);
+  const windowIdRef = useRef<number | null>(null);
+
+  const { cacheEnabled, loadSettings } = useSettingsStore();
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
+
+  // Initialize cache on mount
+  useEffect(() => {
+    window.cacheApi.initialize().then(result => {
+      console.log('[Index] Cache initialized:', result);
+    }).catch(err => {
+      console.warn('[Index] Cache initialization failed:', err);
+    });
+  }, []);
+
+  // Get window ID from main process
+  useEffect(() => {
+    const getWindowId = async () => {
+      try {
+        const id = await window.ipcRenderer.invoke('get-window-id') as number | null;
+        console.log('[Index] Got window ID:', id);
+        windowIdRef.current = id;
+      } catch (error) {
+        console.warn('[Index] Failed to get window ID:', error);
+        windowIdRef.current = 1;
+      }
+    };
+    getWindowId();
+  }, []);
 
   useEffect(() => {
     console.log('[Index] State check:', {
@@ -44,7 +78,25 @@ const Index = () => {
     if (isInitialized) return;
 
     const initTerminal = async () => {
-      console.log('[Index] initTerminal started');
+      const currentWindowId = windowIdRef.current;
+      console.log('[Index] initTerminal started, windowId:', currentWindowId);
+      
+      // Wait for windowId if not yet available
+      if (currentWindowId === null) {
+        console.log('[Index] Waiting for window ID...');
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (windowIdRef.current === null) {
+          console.warn('[Index] Window ID still null, using fallback 1');
+          windowIdRef.current = 1;
+        }
+      }
+      
+      const winId = windowIdRef.current;
+      if (!winId) {
+        console.error('[Index] No window ID available');
+        return;
+      }
+      
       try {
         // 1. Get Home Directory
         let home: string;
@@ -56,18 +108,106 @@ const Index = () => {
         }
         setHomeDir(home);
 
-        // 2. Prepare Initial Tab
+        // 2. Try to restore cached session
+        console.log('[Index] cacheEnabled:', cacheEnabled, 'windowId:', winId);
+        if (cacheEnabled && !restoreAttempted.current) {
+          restoreAttempted.current = true;
+          console.log('[Index] Attempting to restore cached session...');
+          try {
+            // Get all cached entries
+            const cacheState = await window.cacheApi.getState();
+            console.log('[Index] Cache state:', cacheState);
+
+            if (cacheState && Array.isArray(cacheState.entries) && cacheState.entries.length > 0) {
+              // Sort by timestamp (most recent first)
+              const sortedEntries = [...cacheState.entries].sort((a: any, b: any) => b.timestamp - a.timestamp);
+              console.log('[Index] Found', sortedEntries.length, 'cached window(s)');
+
+              // Restore first window in THIS window
+              const firstEntry = sortedEntries[0];
+              if (firstEntry && Array.isArray(firstEntry.tabs) && firstEntry.tabs.length > 0) {
+                console.log('[Index] Restoring', firstEntry.tabs.length, 'tabs in current window');
+
+                // Remove welcome tab
+                const welcomeTabId = useTerminalStore.getState().tabs.find(t => t.type === 'welcome')?.id;
+                if (welcomeTabId) {
+                  try {
+                    await window.ipcRenderer.invoke('remove-tab', welcomeTabId);
+                    useTerminalStore.getState().removeTab(welcomeTabId);
+                  } catch (e) {
+                    console.error('[Index] Failed to remove welcome tab:', e);
+                  }
+                }
+
+                // Restore tabs from first entry
+                for (const tab of firstEntry.tabs) {
+                  if (!tab || !tab.id || !tab.cwd) {
+                    console.warn('[Index] Invalid tab data, skipping:', tab);
+                    continue;
+                  }
+
+                  console.log('[Index] Restoring tab:', tab);
+                  try {
+                    await window.ipcRenderer.invoke('init-tab', tab.id, tab.cwd);
+                    await window.cacheApi.registerTab(winId, tab.id); // Await this operation
+                  } catch (e) {
+                    console.error('[Index] init-tab IPC failed for cached tab', e);
+                  }
+                  addTab({
+                    id: tab.id,
+                    title: tab.title || tab.cwd.split('/').pop() || 'unknown',
+                    cwd: tab.cwd,
+                    isReady: true,
+                    type: tab.type || 'terminal'
+                  });
+                }
+
+                // Set active tab
+                if (firstEntry.activeTabId) {
+                  useTerminalStore.getState().setActiveTab(firstEntry.activeTabId);
+                }
+
+                // Create additional windows for remaining entries
+                if (sortedEntries.length > 1) {
+                  console.log('[Index] Creating', sortedEntries.length - 1, 'additional window(s)');
+                  for (let i = 1; i < sortedEntries.length; i++) {
+                    const entry = sortedEntries[i];
+                    if (entry.tabs && Array.isArray(entry.tabs) && entry.tabs.length > 0) {
+                      try {
+                        console.log('[Index] Creating window with', entry.tabs.length, 'tabs');
+                        await window.ipcRenderer.invoke('create-window-with-tabs', entry.tabs);
+                      } catch (e) {
+                        console.error('[Index] Failed to create additional window:', e);
+                      }
+                    }
+                  }
+                }
+
+                console.log('[Index] Session restored successfully');
+                setInitialized(true);
+                return;
+              }
+            }
+          } catch (error) {
+            console.warn('[Index] Failed to restore cached session:', error);
+          }
+        }
+
+        // 3. Prepare Initial Tab (fallback)
         const initialTabId = window.crypto.randomUUID();
         console.log('[Index] Initializing tab:', initialTabId);
 
-        // 3. Initialize PTY in Main Process
+        // 4. Initialize PTY in Main Process
         try {
           await window.ipcRenderer.invoke('init-tab', initialTabId);
+          if (winId) {
+            window.cacheApi.registerTab(winId, initialTabId);
+          }
         } catch (e) {
           console.error('[Index] init-tab IPC failed', e);
         }
 
-        // 4. Update Store
+        // 5. Update Store
         console.log('[Index] Adding initial tab: Welcome');
         addTab({
           id: initialTabId,
@@ -96,7 +236,7 @@ const Index = () => {
     };
 
     initTerminal();
-  }, [isInitialized, setHomeDir, getDirectoryName, addTab, setInitialized]);
+  }, [isInitialized, setHomeDir, getDirectoryName, addTab, setInitialized, cacheEnabled]);
 
   // Handle library tabs loaded from new window
   useEffect(() => {
@@ -117,7 +257,8 @@ const Index = () => {
         tabs.forEach(async (tab) => {
           console.log('[Index] Loading tab:', tab);
           try {
-            await window.ipcRenderer.invoke('init-tab', tab.id);
+            // Pass the saved cwd to init-tab so PTY starts in the correct directory
+            await window.ipcRenderer.invoke('init-tab', tab.id, tab.cwd);
           } catch (e) {
             console.error('[Index] init-tab IPC failed for library tab', e);
           }
@@ -159,7 +300,8 @@ const Index = () => {
           for (const tab of tabs) {
             console.log('[Index] Loading tab from URL:', tab);
             try {
-              await window.ipcRenderer.invoke('init-tab', tab.id);
+              // Pass the saved cwd to init-tab so PTY starts in the correct directory
+              await window.ipcRenderer.invoke('init-tab', tab.id, tab.cwd);
             } catch (e) {
               console.error('[Index] init-tab IPC failed for library tab', e);
             }

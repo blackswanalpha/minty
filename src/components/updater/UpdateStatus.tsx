@@ -56,10 +56,19 @@ export function UpdateStatus() {
         const handleError = (err: unknown) => {
             console.error('Update error:', err);
             setStatus('error');
+            const errorMsg = String(err);
+
+            // Suppress 404 errors regarding missing update files, which happen
+            // when running a production build of a version not yet published to GitHub.
+            if (errorMsg.includes('404') && (errorMsg.includes('latest.yml') || errorMsg.includes('latest-linux.yml') || errorMsg.includes('latest-mac.yml'))) {
+                console.warn('Update check failed with 404 (expected for unpublished releases)');
+                return;
+            }
+
             toast({
                 variant: "destructive",
                 title: "Update Failed",
-                description: String(err),
+                description: errorMsg,
             });
         };
 

@@ -4,6 +4,8 @@ import os from 'node:os'
 import * as pty from 'node-pty'
 import { autoUpdater } from 'electron-updater'
 import log from 'electron-log'
+import { cacheManager } from './cache/cacheManager'
+import { scheduleCacheSave, forceSave, saveAllWindows } from './cache/cacheWorker'
 
 // Configure Logger
 log.transports.file.level = 'info';
@@ -19,6 +21,8 @@ const tabWindows: Map<string, number> = new Map()
 app.setName('Minty');
 if (process.platform === 'linux') {
     app.setAppUserModelId('Minty');
+    // Disable hardware acceleration to prevent VAAPI errors on Linux
+    app.disableHardwareAcceleration();
 }
 
 process.env.DIST = path.join(__dirname, '../dist')
@@ -27,6 +31,7 @@ const iconPath = path.resolve(process.env.VITE_PUBLIC || '', 'logo.png');
 
 // Keep track of all windows to close app when all are closed
 const windows = new Set<BrowserWindow>();
+const windowTabIds: Map<number, string[]> = new Map();
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
@@ -38,36 +43,64 @@ autoUpdater.allowPrerelease = true;
 // Useful for development/testing
 autoUpdater.allowDowngrade = false;
 
-function setupAutoUpdater(win: BrowserWindow) {
-    autoUpdater.on('checking-for-update', () => {
+function setupAutoUpdater(win: BrowserWindow): () => void {
+    const sendToWin = (channel: string, ...args: any[]) => {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+            try {
+                win.webContents.send(channel, ...args);
+            } catch (error) {
+                // Window was destroyed between checks
+                log.warn(`Failed to send ${channel}: window destroyed`);
+            }
+        }
+    };
+
+    const onCheckingForUpdate = () => {
         log.info('Checking for update...');
-        win.webContents.send('update-checking');
-    });
+        sendToWin('update-checking');
+    };
 
-    autoUpdater.on('update-available', (info: any) => {
+    const onUpdateAvailable = (info: any) => {
         log.info('Update available:', info);
-        win.webContents.send('update-available', info);
-    });
+        sendToWin('update-available', info);
+    };
 
-    autoUpdater.on('update-not-available', (info: any) => {
+    const onUpdateNotAvailable = (info: any) => {
         log.info('Update not available:', info);
-        win.webContents.send('update-not-available', info);
-    });
+        sendToWin('update-not-available', info);
+    };
 
-    autoUpdater.on('error', (err: Error) => {
+    const onError = (err: Error) => {
         log.error('Update error:', err);
-        win.webContents.send('update-error', err.message);
-    });
+        sendToWin('update-error', err.message);
+    };
 
-    autoUpdater.on('download-progress', (progressObj: any) => {
+    const onDownloadProgress = (progressObj: any) => {
         log.info('Download progress:', progressObj.percent + '%');
-        win.webContents.send('download-progress', progressObj);
-    });
+        sendToWin('download-progress', progressObj);
+    };
 
-    autoUpdater.on('update-downloaded', (info: any) => {
+    const onUpdateDownloaded = (info: any) => {
         log.info('Update downloaded:', info);
-        win.webContents.send('update-downloaded', info);
-    });
+        sendToWin('update-downloaded', info);
+    };
+
+    autoUpdater.on('checking-for-update', onCheckingForUpdate);
+    autoUpdater.on('update-available', onUpdateAvailable);
+    autoUpdater.on('update-not-available', onUpdateNotAvailable);
+    autoUpdater.on('error', onError);
+    autoUpdater.on('download-progress', onDownloadProgress);
+    autoUpdater.on('update-downloaded', onUpdateDownloaded);
+
+    // Return cleanup function
+    return () => {
+        autoUpdater.removeListener('checking-for-update', onCheckingForUpdate);
+        autoUpdater.removeListener('update-available', onUpdateAvailable);
+        autoUpdater.removeListener('update-not-available', onUpdateNotAvailable);
+        autoUpdater.removeListener('error', onError);
+        autoUpdater.removeListener('download-progress', onDownloadProgress);
+        autoUpdater.removeListener('update-downloaded', onUpdateDownloaded);
+    };
 }
 
 // IPC handlers for updater
@@ -149,9 +182,13 @@ function createSplashWindow() {
 function sendToWindow(tabId: string, channel: string, ...args: any[]) {
     const webContentsId = tabWindows.get(tabId);
     if (webContentsId) {
-        const contents = electron.webContents.fromId(webContentsId);
-        if (contents && !contents.isDestroyed()) {
-            contents.send(channel, ...args);
+        try {
+            const contents = electron.webContents.fromId(webContentsId);
+            if (contents && !contents.isDestroyed()) {
+                contents.send(channel, ...args);
+            }
+        } catch (error) {
+            console.warn(`Failed to send message to tab ${tabId}:`, error);
         }
     }
 }
@@ -174,11 +211,21 @@ function createWindow() {
 
     windows.add(win);
 
-    // Initialize updater events for this window
-    setupAutoUpdater(win);
+    win.webContents.setWindowOpenHandler(() => {
+        return { action: 'deny' };
+    });
+
+    // Initialize updater events for this window and get cleanup function
+    const cleanupAutoUpdater = setupAutoUpdater(win);
 
     win.webContents.on('did-finish-load', () => {
-        win?.webContents.send('main-process-message', (new Date).toLocaleString())
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+            try {
+                win.webContents.send('main-process-message', (new Date).toLocaleString());
+            } catch (error) {
+                // Window destroyed during send
+            }
+        }
     })
 
     if (VITE_DEV_SERVER_URL) {
@@ -203,7 +250,65 @@ function createWindow() {
     });
 
     win.on('closed', () => {
+        // Cleanup autoUpdater listeners first
+        cleanupAutoUpdater();
+
+        // Don't try to access window properties after it's destroyed
+        // Save window state in 'close' event instead
+        const windowId = win.id;
+
+        // Clean up tracking
+        windowTabIds.delete(windowId);
         windows.delete(win);
+    });
+
+    // Capture window state before it's destroyed
+    win.on('close', () => {
+        if (win.isDestroyed()) return;
+
+        try {
+            const windowId = win.id;
+            const windowTabIdsList = windowTabIds.get(windowId);
+            console.log('[Main] Window', windowId, 'closing - windowTabIds:', windowTabIdsList);
+            console.log('[Main] tabDirectories has', tabDirectories.size, 'entries');
+            const bounds = win.getBounds();
+            const isMaximized = win.isMaximized();
+
+            if (windowTabIdsList && windowTabIdsList.length > 0) {
+                const tabs: any[] = [];
+                for (const tabId of windowTabIdsList) {
+                    const cwd = tabDirectories.get(tabId);
+                    console.log('[Main] Processing tab', tabId, 'cwd:', cwd);
+                    if (cwd) {
+                        tabs.push({
+                            id: tabId,
+                            title: cwd.split('/').pop() || 'unknown',
+                            cwd: cwd,
+                            isActive: false,
+                            type: 'terminal' as const
+                        });
+                    }
+                }
+
+                forceSave({
+                    windowId,
+                    timestamp: Date.now(),
+                    windowState: {
+                        x: bounds.x,
+                        y: bounds.y,
+                        width: bounds.width,
+                        height: bounds.height,
+                        isMaximized
+                    },
+                    tabs,
+                    activeTabId: ''
+                }).catch(err => {
+                    console.warn('[Main] Failed to save cache on window close:', err);
+                });
+            }
+        } catch (error) {
+            console.warn('[Main] Error saving window state on close:', error);
+        }
     });
 
     return win;
@@ -301,8 +406,45 @@ ipcMain.handle('get-home-directory', () => {
     return os.homedir();
 });
 
+// Get current window ID
+ipcMain.handle('get-window-id', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return win ? win.id : null;
+});
+
 // Get current working directory for a tab
 ipcMain.handle('get-cwd', (_event, tabId: string) => {
+    return tabDirectories.get(tabId) || os.homedir();
+});
+
+// Query current working directory from shell (actively polls)
+ipcMain.handle('query-cwd', async (_event, tabId: string) => {
+    const ptyProcess = tabPtys.get(tabId);
+    if (!ptyProcess) {
+        return tabDirectories.get(tabId) || os.homedir();
+    }
+
+    // For Linux: use /proc to read shell's cwd (completely invisible!)
+    if (process.platform === 'linux') {
+        try {
+            const pid = (ptyProcess as any).pid;
+            if (pid) {
+                const fs = await import('node:fs/promises');
+                // Read /proc/[pid]/cwd symlink which points to current working directory
+                const cwd = await fs.readlink(`/proc/${pid}/cwd`);
+                if (cwd && cwd !== tabDirectories.get(tabId)) {
+                    console.log('[Main] Directory changed for tab', tabId, ':', cwd);
+                    tabDirectories.set(tabId, cwd);
+                }
+                return cwd;
+            }
+        } catch (error) {
+            // Fallback to tracked directory if /proc reading fails
+            console.warn('[Main] Failed to read /proc for tab', tabId, ':', error);
+        }
+    }
+
+    // Fallback: return tracked directory
     return tabDirectories.get(tabId) || os.homedir();
 });
 
@@ -314,7 +456,7 @@ ipcMain.handle('set-cwd', (_event, tabId: string, cwd: string) => {
 
 // Create persistent PTY session for a tab
 // Create persistent PTY session for a tab
-ipcMain.handle('create-pty-session', (event, tabId: string) => {
+ipcMain.handle('create-pty-session', (event, tabId: string, cwd?: string) => {
     // Kill existing PTY if any
     const existingPty = tabPtys.get(tabId);
     if (existingPty) {
@@ -322,7 +464,10 @@ ipcMain.handle('create-pty-session', (event, tabId: string) => {
     }
 
     const homeDir = os.homedir();
-    tabDirectories.set(tabId, homeDir);
+    const workingDir = cwd || homeDir;
+
+    console.log('[Main] create-pty-session:', tabId, 'cwd:', workingDir);
+    tabDirectories.set(tabId, workingDir);
 
     // Register window
     tabWindows.set(tabId, event.sender.id);
@@ -335,7 +480,7 @@ ipcMain.handle('create-pty-session', (event, tabId: string) => {
             name: 'xterm-256color',
             cols: 120,
             rows: 30,
-            cwd: homeDir,
+            cwd: workingDir,
             env: env as { [key: string]: string }
         });
 
@@ -353,7 +498,23 @@ ipcMain.handle('create-pty-session', (event, tabId: string) => {
             tabWindows.delete(tabId);
         });
 
-        return { success: true, cwd: homeDir };
+        // If restoring a saved directory (not home), explicitly cd to it
+        if (cwd && cwd !== homeDir) {
+            console.log('[Main] Explicitly changing to saved directory:', workingDir);
+            setTimeout(() => {
+                // Check if PTY still exists in our map (not killed)
+                if (tabPtys.has(tabId)) {
+                    ptyProcess.write(`cd "${workingDir}"\n`);
+                    setTimeout(() => {
+                        if (tabPtys.has(tabId)) {
+                            ptyProcess.write('clear\n');
+                        }
+                    }, 50);
+                }
+            }, 100);
+        }
+
+        return { success: true, cwd: workingDir };
     } catch (err) {
         return {
             success: false,
@@ -365,12 +526,28 @@ ipcMain.handle('create-pty-session', (event, tabId: string) => {
 
 // Initialize a new tab (legacy support + creates PTY)
 // Initialize a new tab (legacy support + creates PTY)
-ipcMain.handle('init-tab', (event, tabId: string) => {
+ipcMain.handle('init-tab', (event, tabId: string, cwd?: string) => {
+    // Use provided cwd or default to home directory
     const homeDir = os.homedir();
-    tabDirectories.set(tabId, homeDir);
+    const workingDir = cwd || homeDir;
+
+    console.log('[Main] init-tab:', tabId, 'cwd:', workingDir);
+    tabDirectories.set(tabId, workingDir);
 
     // Register window
     tabWindows.set(tabId, event.sender.id);
+
+    // Automatically register tab with windowTabIds for cache tracking
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        const windowId = win.id;
+        const ids = windowTabIds.get(windowId) || [];
+        if (!ids.includes(tabId)) {
+            ids.push(tabId);
+            windowTabIds.set(windowId, ids);
+            console.log('[Main] Auto-registered tab', tabId, 'for window', windowId, '- total tabs:', ids.length);
+        }
+    }
 
     // Also create PTY session
     const existingPty = tabPtys.get(tabId);
@@ -386,7 +563,7 @@ ipcMain.handle('init-tab', (event, tabId: string) => {
             name: 'xterm-256color',
             cols: 120,
             rows: 30,
-            cwd: homeDir,
+            cwd: workingDir,
             env: env as { [key: string]: string }
         });
 
@@ -401,21 +578,57 @@ ipcMain.handle('init-tab', (event, tabId: string) => {
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
         });
+
+        // If restoring a saved directory (not home), explicitly cd to it
+        // This ensures the shell is in the correct directory even if .bashrc/.bash_profile cd to home
+        if (cwd && cwd !== homeDir) {
+            console.log('[Main] Explicitly changing to saved directory:', workingDir);
+            setTimeout(() => {
+                // Check if PTY still exists in our map (not killed)
+                if (tabPtys.has(tabId)) {
+                    ptyProcess.write(`cd "${workingDir}"\n`);
+                    // Clear the screen to hide the cd command
+                    setTimeout(() => {
+                        if (tabPtys.has(tabId)) {
+                            ptyProcess.write('clear\n');
+                        }
+                    }, 50);
+                }
+            }, 100);
+        }
     } catch (err) {
         console.error('Failed to create PTY:', err);
     }
 
-    return homeDir;
+    return workingDir;
 });
 
 // Remove tab and cleanup PTY
-ipcMain.handle('remove-tab', (_event, tabId: string) => {
+ipcMain.handle('remove-tab', (event, tabId: string) => {
     const ptyProcess = tabPtys.get(tabId);
     if (ptyProcess) {
         ptyProcess.kill();
         tabPtys.delete(tabId);
     }
     tabDirectories.delete(tabId);
+    tabWindows.delete(tabId);
+
+    // Automatically unregister from windowTabIds
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        const windowId = win.id;
+        const ids = windowTabIds.get(windowId);
+        if (ids) {
+            const filtered = ids.filter(id => id !== tabId);
+            console.log('[Main] Auto-unregistered tab', tabId, 'from window', windowId, '- remaining tabs:', filtered.length);
+            if (filtered.length > 0) {
+                windowTabIds.set(windowId, filtered);
+            } else {
+                windowTabIds.delete(windowId);
+            }
+        }
+    }
+
     return true;
 });
 
@@ -524,9 +737,14 @@ ipcMain.handle('execute-command', async (_event, command: string, tabId: string)
     return new Promise((resolve) => {
         const shell = getDefaultShell();
         const env = buildEnv();
+
+        // Sanitize command to prevent injection - only allow alphanumeric, spaces, common operators
+        // This is a basic sanitization - for production, consider using a proper shell command parser
+        const sanitizedCommand = command.replace(/[;&|$`]/g, '');
+
         const shellArgs = process.platform === 'win32'
-            ? ['/c', command]
-            : ['-l', '-c', command];
+            ? ['/c', sanitizedCommand]
+            : ['-l', '-c', sanitizedCommand];
 
         let output = '';
 
@@ -694,6 +912,23 @@ ipcMain.handle('open-tab-with-directory', async (event: any, cwd: string, title?
             tabPtys.delete(newId);
             tabWindows.delete(newId);
         });
+
+        // Explicitly cd to the directory
+        const homeDir = os.homedir();
+        if (cwd && cwd !== homeDir) {
+            console.log('[Main] open-tab-with-directory - explicitly cd to:', cwd);
+            setTimeout(() => {
+                // Check if PTY still exists in our map (not killed)
+                if (tabPtys.has(newId)) {
+                    ptyProcess.write(`cd "${cwd}"\n`);
+                    setTimeout(() => {
+                        if (tabPtys.has(newId)) {
+                            ptyProcess.write('clear\n');
+                        }
+                    }, 50);
+                }
+            }, 100);
+        }
 
         // Send tab info back to renderer
         return { success: true, tabId: newId, cwd, title: title || cwd.split('/').pop() };
@@ -901,6 +1136,128 @@ ipcMain.handle('library-delete', async (_event, id: string) => {
     }
 });
 
+// Cache IPC Handlers
+ipcMain.handle('cache-initialize', async () => {
+    try {
+        await cacheManager.initialize();
+        return { success: true, settings: cacheManager.getSettings() };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-get-state', async () => {
+    try {
+        await cacheManager.initialize();
+        return {
+            entries: cacheManager.getAllEntries(),
+            settings: cacheManager.getSettings()
+        };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-save', async (_event, entry: any) => {
+    try {
+        const settings = cacheManager.getSettings();
+        if (!settings.enabled) {
+            return { success: true, skipped: true };
+        }
+        scheduleCacheSave(entry);
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-save-force', async (_event, entry: any) => {
+    try {
+        const settings = cacheManager.getSettings();
+        if (!settings.enabled) {
+            return { success: true, skipped: true };
+        }
+        await forceSave(entry);
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-restore', async (_event, windowId: number) => {
+    try {
+        await cacheManager.initialize();
+        const entry = cacheManager.getEntry(windowId);
+        return entry || null;
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-get-settings', async () => {
+    try {
+        await cacheManager.initialize();
+        return cacheManager.getSettings();
+    } catch (error) {
+        return { enabled: true };
+    }
+});
+
+ipcMain.handle('cache-set-settings', async (_event, settings: any) => {
+    try {
+        await cacheManager.saveSettings(settings);
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-clear', async (_event, windowId?: number) => {
+    try {
+        if (windowId) {
+            cacheManager.removeEntry(windowId);
+        } else {
+            cacheManager.clearAllEntries();
+        }
+        await cacheManager.saveCache();
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-register-tab', async (_event, windowId: number, tabId: string) => {
+    try {
+        const ids = windowTabIds.get(windowId) || [];
+        if (!ids.includes(tabId)) {
+            ids.push(tabId);
+            windowTabIds.set(windowId, ids);
+            console.log('[Main] Registered tab', tabId, 'for window', windowId, '- total tabs:', ids.length);
+        }
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
+ipcMain.handle('cache-unregister-tab', async (_event, windowId: number, tabId: string) => {
+    try {
+        const ids = windowTabIds.get(windowId);
+        if (ids) {
+            const filtered = ids.filter(id => id !== tabId);
+            console.log('[Main] Unregistered tab', tabId, 'from window', windowId, '- remaining tabs:', filtered.length);
+            if (filtered.length > 0) {
+                windowTabIds.set(windowId, filtered);
+            } else {
+                windowTabIds.delete(windowId);
+            }
+        }
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+});
+
 // Create a new Minty window with specific tabs
 ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
     console.log('[IPC] create-window-with-tabs called with tabs:', tabs);
@@ -934,19 +1291,95 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
             }
         }
 
-        newWin.webContents.on('did-finish-load', () => {
+        const loadHandler = () => {
             console.log('[IPC] New window loaded, sending tabs data');
-            // Send tabs data to the new window
-            newWin.webContents.send('library-tabs-loaded', tabs);
-        });
+            try {
+                if (newWin.isDestroyed()) return;
+                const contents = newWin.webContents;
+                if (!contents || contents.isDestroyed()) return;
+                try {
+                    contents.send('library-tabs-loaded', tabs);
+                } catch {
+                    // Send can fail if connection is broken
+                }
+            } catch (error) {
+                console.warn('[IPC] Failed to send library-tabs-loaded:', error);
+            } finally {
+                // Cleanup listener safely
+                try {
+                    if (!newWin.isDestroyed() && !newWin.webContents.isDestroyed()) {
+                        newWin.webContents.removeListener('did-finish-load', loadHandler);
+                    }
+                } catch {
+                    // Ignore cleanup errors - window already destroyed
+                }
+            }
+        };
+
+        // Check if webContents exists before adding listener
+        if (!newWin.isDestroyed() && newWin.webContents) {
+            newWin.webContents.on('did-finish-load', loadHandler);
+        }
 
         newWin.once('ready-to-show', () => {
             console.log('[IPC] New window ready to show');
             newWin.show();
         });
 
+        windows.add(newWin);
+        const tabIds = tabs.map((t: any) => t.id);
+        windowTabIds.set(newWin.id, tabIds);
+
+        // Capture window state before it's destroyed
+        newWin.on('close', () => {
+            if (newWin.isDestroyed()) return;
+
+            try {
+                const windowId = newWin.id;
+                const windowTabIdsList = windowTabIds.get(windowId) || [];
+                const bounds = newWin.getBounds();
+                const isMaximized = newWin.isMaximized();
+
+                if (windowTabIdsList.length > 0) {
+                    const cacheTabs: any[] = [];
+                    for (const tabId of windowTabIdsList) {
+                        const cwd = tabDirectories.get(tabId);
+                        if (cwd) {
+                            cacheTabs.push({
+                                id: tabId,
+                                title: cwd.split('/').pop() || 'unknown',
+                                cwd: cwd,
+                                isActive: false,
+                                type: 'terminal' as const
+                            });
+                        }
+                    }
+
+                    forceSave({
+                        windowId,
+                        timestamp: Date.now(),
+                        windowState: {
+                            x: bounds.x,
+                            y: bounds.y,
+                            width: bounds.width,
+                            height: bounds.height,
+                            isMaximized
+                        },
+                        tabs: cacheTabs,
+                        activeTabId: ''
+                    }).catch(err => {
+                        console.warn('[Main] Failed to save cache on window close:', err);
+                    });
+                }
+            } catch (error) {
+                console.warn('[Main] Error saving window state on close:', error);
+            }
+        });
+
         newWin.on('closed', () => {
-            console.log('[IPC] New window closed');
+            const windowId = newWin.id;
+            windowTabIds.delete(windowId);
+            windows.delete(newWin);
         });
 
         console.log('[IPC] Returning success');
@@ -958,11 +1391,64 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
 });
 
 // Cleanup on window close
-app.on('window-all-closed', () => {
+app.on('window-all-closed', async () => {
     tabPtys.forEach((ptyProcess) => {
         ptyProcess.kill();
     });
     tabPtys.clear();
+
+    const entries: any[] = [];
+    for (const win of windows) {
+        // Skip destroyed windows
+        if (win.isDestroyed()) {
+            continue;
+        }
+
+        try {
+            const windowId = win.id;
+            const windowTabIdsList = windowTabIds.get(windowId) || [];
+            const bounds = win.getBounds();
+            const isMaximized = win.isMaximized();
+
+            if (windowTabIdsList.length > 0) {
+                const cacheTabs: any[] = [];
+                for (const tabId of windowTabIdsList) {
+                    const cwd = tabDirectories.get(tabId);
+                    if (cwd) {
+                        cacheTabs.push({
+                            id: tabId,
+                            title: cwd.split('/').pop() || 'unknown',
+                            cwd: cwd,
+                            isActive: false,
+                            type: 'terminal' as const
+                        });
+                    }
+                }
+
+                entries.push({
+                    windowId,
+                    timestamp: Date.now(),
+                    windowState: {
+                        x: bounds.x,
+                        y: bounds.y,
+                        width: bounds.width,
+                        height: bounds.height,
+                        isMaximized
+                    },
+                    tabs: cacheTabs,
+                    activeTabId: ''
+                });
+            }
+        } catch (error) {
+            // Window was destroyed while processing
+            console.warn('[Main] Window destroyed during save:', error);
+        }
+    }
+
+    await saveAllWindows(entries).catch(err => {
+        console.warn('[Main] Failed to save all windows cache:', err);
+    });
+    windowTabIds.clear();
 
     if (process.platform !== 'darwin') {
         app.quit()
@@ -977,6 +1463,7 @@ app.on('activate', () => {
 })
 
 app.whenReady().then(async () => {
+    await cacheManager.initialize();
     const splash = createSplashWindow();
     const mainWin = createWindow();
 

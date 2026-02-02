@@ -57,3 +57,17 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
         return ipcRenderer.sendSync(channel, ...args)
     }
 })
+
+// Expose Cache API to renderer process
+contextBridge.exposeInMainWorld('cacheApi', {
+    initialize: () => ipcRenderer.invoke('cache-initialize'),
+    getState: () => ipcRenderer.invoke('cache-get-state'),
+    save: (entry: any) => ipcRenderer.invoke('cache-save', entry),
+    saveForce: (entry: any) => ipcRenderer.invoke('cache-save-force', entry),
+    restore: (windowId: number) => ipcRenderer.invoke('cache-restore', windowId),
+    getSettings: () => ipcRenderer.invoke('cache-get-settings'),
+    setSettings: (settings: any) => ipcRenderer.invoke('cache-set-settings', settings),
+    clear: (windowId?: number) => ipcRenderer.invoke('cache-clear', windowId),
+    registerTab: (windowId: number, tabId: string) => ipcRenderer.invoke('cache-register-tab', windowId, tabId),
+    unregisterTab: (windowId: number, tabId: string) => ipcRenderer.invoke('cache-unregister-tab', windowId, tabId)
+})
