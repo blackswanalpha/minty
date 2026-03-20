@@ -1,9 +1,12 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useCallback, memo } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { SearchAddon } from '@xterm/addon-search';
 import { ptyEventManager } from '@/lib/ptyEventManager';
 import { useTerminalStore } from '@/stores/terminalStore';
+import { useTerminalSearchStore } from '@/stores/terminalSearchStore';
 import { TerminalContextMenu } from './TerminalContextMenu';
+import { TerminalSearchBar } from './TerminalSearchBar';
 import { toast } from 'sonner';
 import '@xterm/xterm/css/xterm.css';
 
@@ -12,12 +15,20 @@ interface XTerminalProps {
   isActive: boolean;
 }
 
-export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
+const XTerminalInner = ({ tabId, isActive }: XTerminalProps) => {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
   const initializedRef = useRef(false);
   const updateTab = useTerminalStore(state => state.updateTab);
+
+  const isSearchOpen = useTerminalSearchStore(s => s.isOpen);
+  const setMatchCount = useTerminalSearchStore(s => s.setMatchCount);
+  const setCurrentMatch = useTerminalSearchStore(s => s.setCurrentMatch);
+  const closeSearch = useTerminalSearchStore(s => s.close);
+  const nextMatch = useTerminalSearchStore(s => s.nextMatch);
+  const prevMatch = useTerminalSearchStore(s => s.prevMatch);
 
   // Initialize terminal - only runs once per tabId
   useEffect(() => {
@@ -55,13 +66,15 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
         brightWhite: '#fafafa',
       },
       allowProposedApi: true,
-      scrollback: 10000,
+      scrollback: 5000,
       convertEol: true,
       rightClickSelectsWord: true,
     });
 
     const fitAddon = new FitAddon();
+    const searchAddon = new SearchAddon();
     term.loadAddon(fitAddon);
+    term.loadAddon(searchAddon);
 
     // Open terminal in container
     term.open(terminalRef.current);
@@ -69,6 +82,7 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
     // Store refs
     xtermRef.current = term;
     fitAddonRef.current = fitAddon;
+    searchAddonRef.current = searchAddon;
 
     // Fit to container after a small delay
     setTimeout(() => {
@@ -96,7 +110,6 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
       }
     });
 
-    // Handle selection change - manual copy on selection for better UX
     // Handle selection change - manual copy on selection for better UX
     // Debounce to prevent race conditions and toast spam
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -140,11 +153,63 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
       if (fitAddonRef.current) {
         fitAddonRef.current = null;
       }
+      if (searchAddonRef.current) {
+        searchAddonRef.current = null;
+      }
       initializedRef.current = false;
     };
   }, [tabId, updateTab]);
 
-  // Handle focus and resize when tab becomes active
+  // Refit helper — shared between the always-on observer and active-focus effect
+  const handleResize = useRef(() => {
+    if (fitAddonRef.current && xtermRef.current) {
+      try {
+        fitAddonRef.current.fit();
+        const dims = fitAddonRef.current.proposeDimensions();
+        if (dims) {
+          window.ipcRenderer.invoke('resize-pty', tabId, dims.cols, dims.rows);
+        }
+      } catch (e) {
+        console.warn('Fit error:', e);
+      }
+    }
+  });
+  // Keep closure fresh without re-running effects
+  handleResize.current = () => {
+    if (fitAddonRef.current && xtermRef.current) {
+      try {
+        fitAddonRef.current.fit();
+        const dims = fitAddonRef.current.proposeDimensions();
+        if (dims) {
+          window.ipcRenderer.invoke('resize-pty', tabId, dims.cols, dims.rows);
+        }
+      } catch (e) {
+        console.warn('Fit error:', e);
+      }
+    }
+  };
+
+  // ResizeObserver — only fires fit + resize-pty when this terminal is active.
+  // Hidden terminals skip the expensive fit/IPC cycle to avoid cascading storms.
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
+
+  useEffect(() => {
+    if (!terminalRef.current) return;
+
+    const observer = new ResizeObserver(() => {
+      if (isActiveRef.current) {
+        setTimeout(() => handleResize.current(), 50);
+      }
+    });
+    observer.observe(terminalRef.current);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [tabId]);
+
+  // Handle focus and initial fit burst when pane/tab becomes active
   useEffect(() => {
     if (!isActive || !xtermRef.current) return;
 
@@ -154,50 +219,121 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
       xtermRef.current.focus();
     }
 
-    // Fit terminal
-    const handleResize = () => {
-      if (fitAddonRef.current && xtermRef.current) {
-        try {
-          fitAddonRef.current.fit();
-          const dims = fitAddonRef.current.proposeDimensions();
-          if (dims) {
-            window.ipcRenderer.invoke('resize-pty', tabId, dims.cols, dims.rows);
-          }
-        } catch (e) {
-          console.warn('Fit error:', e);
-        }
+    // Initial fit burst with cleanup
+    handleResize.current();
+    const t1 = setTimeout(() => {
+      handleResize.current();
+      if (xtermRef.current) {
+        xtermRef.current.refresh(0, xtermRef.current.rows - 1);
       }
-    };
+    }, 100);
+    const t2 = setTimeout(() => handleResize.current(), 300);
 
-    // Initial fit
-    handleResize();
-    setTimeout(handleResize, 100);
-    setTimeout(handleResize, 300);
-
-    // Listen for resize
-    window.addEventListener('resize', handleResize);
-
-    // Use ResizeObserver for container size changes
-    let resizeObserver: ResizeObserver | null = null;
-    if (terminalRef.current) {
-      resizeObserver = new ResizeObserver(() => {
-        setTimeout(handleResize, 50);
-      });
-      resizeObserver.observe(terminalRef.current);
-    }
+    // Window resize listener (only needed for the active terminal)
+    const onWindowResize = () => handleResize.current();
+    window.addEventListener('resize', onWindowResize);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
-      if (resizeObserver) {
-        resizeObserver.disconnect();
-        resizeObserver = null; // Clear reference to prevent memory leaks
-      }
+      clearTimeout(t1);
+      clearTimeout(t2);
+      window.removeEventListener('resize', onWindowResize);
     };
   }, [isActive, tabId]);
 
+  // Search handlers
+  const handleSearch = useCallback((query: string, options: { isRegex: boolean; isCaseSensitive: boolean }) => {
+    if (!searchAddonRef.current) return;
 
-  const handleNewTab = () => {
-    window.ipcRenderer.invoke('create-new-tab');
+    if (!query) {
+      searchAddonRef.current.clearDecorations();
+      setMatchCount(0);
+      setCurrentMatch(0);
+      return;
+    }
+
+    const found = searchAddonRef.current.findNext(query, {
+      regex: options.isRegex,
+      caseSensitive: options.isCaseSensitive,
+      incremental: true,
+    });
+
+    // xterm search addon doesn't expose match count directly,
+    // so we do a buffer scan to count matches
+    if (xtermRef.current) {
+      let count = 0;
+      const buffer = xtermRef.current.buffer.active;
+      for (let i = 0; i < buffer.length; i++) {
+        const line = buffer.getLine(i)?.translateToString() || '';
+        if (!line.trim()) continue;
+        try {
+          if (options.isRegex) {
+            const flags = options.isCaseSensitive ? 'g' : 'gi';
+            const regex = new RegExp(query, flags);
+            const matches = line.match(regex);
+            if (matches) count += matches.length;
+          } else {
+            const searchLine = options.isCaseSensitive ? line : line.toLowerCase();
+            const searchQuery = options.isCaseSensitive ? query : query.toLowerCase();
+            let pos = 0;
+            while ((pos = searchLine.indexOf(searchQuery, pos)) !== -1) {
+              count++;
+              pos += searchQuery.length;
+            }
+          }
+        } catch {
+          // Invalid regex, ignore
+        }
+      }
+      setMatchCount(count);
+      if (found) {
+        setCurrentMatch(0);
+      }
+    }
+  }, [setMatchCount, setCurrentMatch]);
+
+  const handleSearchNext = useCallback(() => {
+    if (searchAddonRef.current) {
+      const { searchQuery, isRegex, isCaseSensitive } = useTerminalSearchStore.getState();
+      searchAddonRef.current.findNext(searchQuery, {
+        regex: isRegex,
+        caseSensitive: isCaseSensitive,
+      });
+      nextMatch();
+    }
+  }, [nextMatch]);
+
+  const handleSearchPrev = useCallback(() => {
+    if (searchAddonRef.current) {
+      const { searchQuery, isRegex, isCaseSensitive } = useTerminalSearchStore.getState();
+      searchAddonRef.current.findPrevious(searchQuery, {
+        regex: isRegex,
+        caseSensitive: isCaseSensitive,
+      });
+      prevMatch();
+    }
+  }, [prevMatch]);
+
+  const handleSearchClose = useCallback(() => {
+    if (searchAddonRef.current) {
+      searchAddonRef.current.clearDecorations();
+    }
+    closeSearch();
+    // Re-focus terminal
+    if (xtermRef.current) {
+      xtermRef.current.focus();
+    }
+  }, [closeSearch]);
+
+  const handleNewTab = async () => {
+    const result = await window.ipcRenderer.invoke('create-new-tab') as { success: boolean; tabId: string; cwd: string; title: string };
+    if (result.success) {
+      useTerminalStore.getState().addTab({
+        id: result.tabId,
+        title: result.title,
+        cwd: result.cwd,
+        isReady: false,
+      });
+    }
   };
 
   const handleNewWindow = () => {
@@ -233,20 +369,32 @@ export const XTerminal = ({ tabId, isActive }: XTerminalProps) => {
       onCopy={handleCopy}
       onPaste={handlePaste}
     >
-      <div
-        ref={terminalRef}
-        className="w-full h-full bg-[#0a0a0a] xterm-container"
-        style={{
-          padding: '8px',
-          minHeight: '300px',
-          height: '100%',
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0
-        }}
-      />
+      <div className="relative w-full h-full">
+        {isActive && isSearchOpen && (
+          <TerminalSearchBar
+            onSearch={handleSearch}
+            onNext={handleSearchNext}
+            onPrev={handleSearchPrev}
+            onClose={handleSearchClose}
+          />
+        )}
+        <div
+          ref={terminalRef}
+          className="w-full h-full bg-[#0a0a0a] xterm-container"
+          style={{
+            padding: '8px',
+            minHeight: '300px',
+            height: '100%',
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0
+          }}
+        />
+      </div>
     </TerminalContextMenu>
   );
 };
+
+export const XTerminal = memo(XTerminalInner);

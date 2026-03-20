@@ -10,6 +10,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
 import { Plus, Square, GitBranch, ExternalLink, Terminal } from "lucide-react";
+import { useTerminalStore } from "@/stores/terminalStore";
 
 interface WindowModalProps {
   open: boolean;
@@ -42,7 +43,15 @@ export function WindowModal({ open, onOpenChange }: WindowModalProps): React.JSX
   const handleNewTab = async (): Promise<void> => {
     setIsCreating(true);
     try {
-      await window.ipcRenderer.invoke("create-new-tab");
+      const result = await window.ipcRenderer.invoke("create-new-tab") as { success: boolean; tabId: string; cwd: string; title: string };
+      if (result.success) {
+        useTerminalStore.getState().addTab({
+          id: result.tabId,
+          title: result.title,
+          cwd: result.cwd,
+          isReady: false,
+        });
+      }
       toast({
         title: "New Tab",
         description: "Opening a new tab in the current window...",

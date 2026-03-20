@@ -3,17 +3,30 @@ import { ToolsSidebar } from "@/components/ToolsSidebar";
 import { TerminalHeader } from "@/components/terminal/TerminalHeader";
 import { TerminalStatusBar } from "@/components/terminal/TerminalStatusBar";
 import { TerminalToolbar } from "@/components/terminal/TerminalToolbar";
-import { XTerminal } from "@/components/terminal/XTerminal";
+import { TerminalPaneGroup } from "@/components/terminal/TerminalPaneGroup";
 import { WelcomePage } from "@/components/WelcomePage";
+import { FileExplorerPanel } from "@/components/file-explorer/FileExplorerPanel";
+import { GitPanel } from "@/components/git-panel/GitPanel";
+import { CommandPalette } from "@/components/CommandPalette";
+import { KeyboardShortcutsModal } from "@/components/settings/KeyboardShortcutsModal";
+import { CodeEditorModal } from "@/components/code-editor/CodeEditorModal";
+import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable";
+import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useTerminalStore } from "@/stores/terminalStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useAiSettingsStore } from "@/stores/aiSettingsStore";
+import { useFileExplorerStore } from "@/stores/fileExplorerStore";
+import { useGitStore } from "@/stores/gitStore";
 import { useDirectorySync } from "@/hooks/useDirectorySync";
+import { useGitSync } from "@/hooks/useGitSync";
+import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
+import { useAiToolNotifications } from "@/hooks/useAiToolNotifications";
+import { EnhancePromptPanel } from "@/components/terminal/EnhancePromptPanel";
 
 
 const Index = () => {
   const tabs = useTerminalStore(state => state.tabs);
   const activeTabId = useTerminalStore(state => state.activeTabId);
-  const homeDir = useTerminalStore(state => state.homeDir);
   const isInitialized = useTerminalStore(state => state.isInitialized);
 
   const setHomeDir = useTerminalStore(state => state.setHomeDir);
@@ -24,14 +37,27 @@ const Index = () => {
     state.tabs.find(t => t.id === state.activeTabId)
   );
 
+  const isFileExplorerOpen = useFileExplorerStore(state => state.isOpen);
+  const openFileExplorer = useFileExplorerStore(state => state.open);
+  const closeFileExplorer = useFileExplorerStore(state => state.close);
+
+  const isGitPanelOpen = useGitStore(state => state.isOpen);
+  const isLeftPanelOpen = isFileExplorerOpen || isGitPanelOpen;
+
+  const leftPanelRef = useRef<ImperativePanelHandle>(null);
+
   const restoreAttempted = useRef(false);
   const windowIdRef = useRef<number | null>(null);
 
   const { cacheEnabled, loadSettings } = useSettingsStore();
+  const loadAiSettings = useAiSettingsStore(state => state.loadSettings);
+  const loadGitHubAuth = useGitStore(state => state.loadGitHubAuth);
 
   useEffect(() => {
     loadSettings();
-  }, [loadSettings]);
+    loadAiSettings();
+    loadGitHubAuth();
+  }, [loadSettings, loadAiSettings, loadGitHubAuth]);
 
   // Initialize cache on mount
   useEffect(() => {
@@ -57,14 +83,15 @@ const Index = () => {
     getWindowId();
   }, []);
 
+  const hasActiveTab = !!activeTab;
   useEffect(() => {
     console.log('[Index] State check:', {
       tabsCount: tabs.length,
       activeTabId,
       isInitialized,
-      hasActiveTab: !!activeTab
+      hasActiveTab
     });
-  }, [tabs.length, activeTabId, isInitialized, !!activeTab]);
+  }, [tabs.length, activeTabId, isInitialized, hasActiveTab]);
 
   // Get directory name from path for tab title
   const getDirectoryName = useCallback((path: string, homePath: string): string => {
@@ -78,19 +105,19 @@ const Index = () => {
     if (isInitialized) return;
 
     const initTerminal = async () => {
-      const currentWindowId = windowIdRef.current;
-      console.log('[Index] initTerminal started, windowId:', currentWindowId);
-      
-      // Wait for windowId if not yet available
-      if (currentWindowId === null) {
-        console.log('[Index] Waiting for window ID...');
-        await new Promise(resolve => setTimeout(resolve, 100));
-        if (windowIdRef.current === null) {
-          console.warn('[Index] Window ID still null, using fallback 1');
+      // Ensure we have the real window ID before proceeding
+      if (windowIdRef.current === null) {
+        console.log('[Index] Fetching window ID...');
+        try {
+          const id = await window.ipcRenderer.invoke('get-window-id') as number | null;
+          windowIdRef.current = id;
+          console.log('[Index] Got window ID:', id);
+        } catch (error) {
+          console.warn('[Index] Failed to get window ID:', error);
           windowIdRef.current = 1;
         }
       }
-      
+
       const winId = windowIdRef.current;
       if (!winId) {
         console.error('[Index] No window ID available');
@@ -108,9 +135,14 @@ const Index = () => {
         }
         setHomeDir(home);
 
-        // 2. Try to restore cached session
-        console.log('[Index] cacheEnabled:', cacheEnabled, 'windowId:', winId);
-        if (cacheEnabled && !restoreAttempted.current) {
+        // 2. Try to restore cached session (only for the first/primary window)
+        let windowCount = 1;
+        try {
+          windowCount = (await window.ipcRenderer.invoke('get-window-count')) as number;
+        } catch { /* default to 1 */ }
+        const isFirstWindow = windowCount <= 1;
+        console.log('[Index] cacheEnabled:', cacheEnabled, 'windowId:', winId, 'windowCount:', windowCount);
+        if (cacheEnabled && !restoreAttempted.current && isFirstWindow) {
           restoreAttempted.current = true;
           console.log('[Index] Attempting to restore cached session...');
           try {
@@ -201,7 +233,7 @@ const Index = () => {
         try {
           await window.ipcRenderer.invoke('init-tab', initialTabId);
           if (winId) {
-            window.cacheApi.registerTab(winId, initialTabId);
+            await window.cacheApi.registerTab(winId, initialTabId);
           }
         } catch (e) {
           console.error('[Index] init-tab IPC failed', e);
@@ -240,7 +272,7 @@ const Index = () => {
 
   // Handle library tabs loaded from new window
   useEffect(() => {
-    const handleLibraryTabsLoaded = (...args: unknown[]) => {
+    const handleLibraryTabsLoaded = async (...args: unknown[]) => {
       console.log('[Index] library-tabs-loaded event received:', args);
       const tabs = args[0] as any[];
       console.log('[Index] Library tabs loaded:', tabs);
@@ -249,15 +281,14 @@ const Index = () => {
         const store = useTerminalStore.getState();
         const welcomeTab = store.tabs.find(t => t.type === 'welcome');
         if (welcomeTab) {
-          window.ipcRenderer.invoke('remove-tab', welcomeTab.id);
+          await window.ipcRenderer.invoke('remove-tab', welcomeTab.id);
           useTerminalStore.getState().removeTab(welcomeTab.id);
         }
-        
-        // Load library tabs
-        tabs.forEach(async (tab) => {
+
+        // Load library tabs sequentially to preserve order
+        for (const tab of tabs) {
           console.log('[Index] Loading tab:', tab);
           try {
-            // Pass the saved cwd to init-tab so PTY starts in the correct directory
             await window.ipcRenderer.invoke('init-tab', tab.id, tab.cwd);
           } catch (e) {
             console.error('[Index] init-tab IPC failed for library tab', e);
@@ -268,12 +299,14 @@ const Index = () => {
             cwd: tab.cwd,
             isReady: false
           });
-        });
+        }
       }
     };
 
     window.ipcRenderer.on('library-tabs-loaded', handleLibraryTabsLoaded);
     return () => {
+      // Use removeAllListeners for reliable cleanup (ipcRenderer.off fails
+      // across contextBridge because function proxies differ between calls)
       window.ipcRenderer.removeAllListeners('library-tabs-loaded');
     };
   }, [addTab]);
@@ -292,10 +325,10 @@ const Index = () => {
           const store = useTerminalStore.getState();
           const welcomeTab = store.tabs.find(t => t.type === 'welcome');
           if (welcomeTab) {
-            window.ipcRenderer.invoke('remove-tab', welcomeTab.id);
+            await window.ipcRenderer.invoke('remove-tab', welcomeTab.id);
             useTerminalStore.getState().removeTab(welcomeTab.id);
           }
-          
+
           // Load library tabs
           for (const tab of tabs) {
             console.log('[Index] Loading tab from URL:', tab);
@@ -326,32 +359,33 @@ const Index = () => {
     }
   }, [isInitialized, addTab]);
 
-  // Handle cross-tab events (e.g. from Library)
+  // Sync left panel collapse/expand with store state
   useEffect(() => {
-    const handleTabCreated = (...args: unknown[]) => {
-      console.log('[Index] tab-created event received:', args);
-      const [, tabId, cwd, title] = args as [unknown, string, string, string];
-      const dirName = getDirectoryName(cwd, homeDir);
-      addTab({
-        id: tabId,
-        title: title || dirName,
-        cwd: cwd,
-        isReady: false
-      });
-    };
-
-    window.ipcRenderer.on('tab-created', handleTabCreated);
-    return () => {
-      window.ipcRenderer.removeAllListeners('tab-created');
-    };
-  }, [homeDir, getDirectoryName, addTab]);
+    const panel = leftPanelRef.current;
+    if (!panel) return;
+    if (isLeftPanelOpen && panel.isCollapsed()) {
+      panel.expand();
+    } else if (!isLeftPanelOpen && !panel.isCollapsed()) {
+      panel.collapse();
+    }
+  }, [isLeftPanelOpen]);
 
   // Use custom hook for directory synchronization
   useDirectorySync();
 
+  // Git panel synchronization
+  useGitSync();
+
+  // Global keyboard shortcuts
+  useGlobalShortcuts();
+
+  // AI tool completion notifications
+  useAiToolNotifications();
+
   const handleClear = useCallback(() => {
     if (activeTabId) {
-      window.ipcRenderer.invoke('send-input', activeTabId, 'clear\n');
+      const paneId = useTerminalStore.getState().getActivePaneId(activeTabId);
+      window.ipcRenderer.invoke('send-input', paneId, 'clear\n');
     }
   }, [activeTabId]);
 
@@ -387,31 +421,61 @@ const Index = () => {
 
   return (
     <div className="min-h-screen bg-background flex">
+      <CommandPalette />
+      <KeyboardShortcutsModal />
+      <CodeEditorModal />
       <ToolsSidebar />
-      <div className="flex-1 pl-14 flex flex-col">
+      <div className="flex-1 pl-14 flex flex-col relative">
         <TerminalToolbar />
         <TerminalHeader onClear={handleClear} />
         <div className="flex-1 relative overflow-hidden" style={{ minHeight: '400px' }}>
-          {tabs.map(tab => (
-            <div
-              key={tab.id}
-              className={`absolute inset-0 ${tab.id === activeTabId ? 'block' : 'hidden'}`}
-              style={{ height: '100%' }}
+          <ResizablePanelGroup direction="horizontal">
+            <ResizablePanel
+              ref={leftPanelRef}
+              defaultSize={isLeftPanelOpen ? 20 : 0}
+              collapsedSize={0}
+              collapsible={true}
+              minSize={15}
+              maxSize={40}
+              onCollapse={() => {
+                closeFileExplorer();
+                useGitStore.getState().close();
+              }}
+              onExpand={() => {
+                if (!isFileExplorerOpen && !isGitPanelOpen) {
+                  openFileExplorer();
+                }
+              }}
             >
-              <div className="h-full w-full">
-                {tab.type === 'welcome' ? (
-                  <WelcomePage />
-                ) : (
-                  <XTerminal
-                    tabId={tab.id}
-                    isActive={tab.id === activeTabId}
-                  />
-                )}
+              {isGitPanelOpen ? <GitPanel /> : <FileExplorerPanel />}
+            </ResizablePanel>
+            <ResizableHandle />
+            <ResizablePanel defaultSize={isLeftPanelOpen ? 80 : 100}>
+              <div className="relative h-full w-full overflow-hidden">
+                {tabs.map(tab => (
+                  <div
+                    key={tab.id}
+                    className={`absolute inset-0 ${tab.id === activeTabId ? 'block' : 'hidden'}`}
+                    style={{ height: '100%' }}
+                  >
+                    <div className="h-full w-full">
+                      {tab.type === 'welcome' ? (
+                        <WelcomePage />
+                      ) : (
+                        <TerminalPaneGroup
+                          tab={tab}
+                          isActive={tab.id === activeTabId}
+                        />
+                      )}
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
-          ))}
+            </ResizablePanel>
+          </ResizablePanelGroup>
         </div>
         <TerminalStatusBar />
+        {activeTab?.type !== 'welcome' && <EnhancePromptPanel />}
       </div>
     </div>
   );

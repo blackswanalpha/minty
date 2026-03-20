@@ -2,12 +2,15 @@ import { Minus, Maximize2, X, Plus, Library, Play } from "lucide-react";
 import { useState, useCallback } from "react";
 import { LibraryModal } from "./LibraryModal";
 import { SaveTabsModal } from "./SaveTabsModal";
-import { useTerminalStore } from "@/stores/terminalStore";
+import { useTerminalStore, MAX_TABS } from "@/stores/terminalStore";
+import { toast } from "sonner";
 
 export const TerminalToolbar = () => {
     const [libraryOpen, setLibraryOpen] = useState(false);
     const [saveTabsOpen, setSaveTabsOpen] = useState(false);
-    const { addTab, homeDir } = useTerminalStore();
+    const { addTab, homeDir, tabs } = useTerminalStore();
+    const nonWelcomeTabs = tabs.filter(t => t.type !== 'welcome');
+    const isAtTabLimit = nonWelcomeTabs.length >= MAX_TABS;
 
     const handleMinimize = () => {
         window.ipcRenderer.send('window-minimize');
@@ -22,6 +25,10 @@ export const TerminalToolbar = () => {
     };
 
     const handleAddTab = useCallback(async () => {
+        if (isAtTabLimit) {
+            toast.warning(`Tab limit reached (${MAX_TABS}). Close a tab first.`);
+            return;
+        }
         try {
             const { v4: uuidv4 } = await import('uuid');
             const newId = uuidv4();
@@ -36,17 +43,22 @@ export const TerminalToolbar = () => {
             });
         } catch (error) {
             console.error('Failed to create tab:', error);
-            const { v4: uuidv4 } = await import('uuid');
-            const fallbackId = uuidv4();
-            const fallbackCwd = homeDir || '/home';
-            addTab({
-                id: fallbackId,
-                title: 'home',
-                cwd: fallbackCwd,
-                isReady: false
-            });
+            try {
+                const { v4: uuidv4 } = await import('uuid');
+                const fallbackId = uuidv4();
+                const fallbackCwd = homeDir || '/home';
+                await window.ipcRenderer.invoke('init-tab', fallbackId, fallbackCwd);
+                addTab({
+                    id: fallbackId,
+                    title: 'home',
+                    cwd: fallbackCwd,
+                    isReady: false
+                });
+            } catch (fallbackError) {
+                console.error('Fallback tab creation also failed:', fallbackError);
+            }
         }
-    }, [addTab, homeDir]);
+    }, [addTab, homeDir, isAtTabLimit]);
 
     return (
         <div className="h-8 bg-card border-b border-border flex items-center justify-between px-2 select-none app-region-drag">

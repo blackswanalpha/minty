@@ -3,10 +3,16 @@ import { useTerminalStore } from '@/stores/terminalStore';
 import { useSettingsStore } from '@/stores/settingsStore';
 
 export const useDirectorySync = () => {
-  const { tabs, updateTab, homeDir, isInitialized } = useTerminalStore();
+  const isInitialized = useTerminalStore(state => state.isInitialized);
+  const homeDir = useTerminalStore(state => state.homeDir);
+  const updateTab = useTerminalStore(state => state.updateTab);
+  const updatePane = useTerminalStore(state => state.updatePane);
+  const tabs = useTerminalStore(state => state.tabs);
+  const activeTabId = useTerminalStore(state => state.activeTabId);
   const { cacheEnabled } = useSettingsStore();
   const windowIdRef = useRef<number | null>(null);
   const hasChangesRef = useRef(false);
+  const saveCacheTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const getWindowId = useCallback(async () => {
     if (windowIdRef.current === null) {
@@ -35,27 +41,34 @@ export const useDirectorySync = () => {
     const winId = await getWindowId();
     if (!winId) return;
 
-    const activeTab = tabs.find(t => t.id === useTerminalStore.getState().activeTabId);
+    // Read fresh state inside callback to avoid stale closures
+    const { tabs: freshTabs, activeTabId: freshActiveTabId } = useTerminalStore.getState();
+    const activeTab = freshTabs.find(t => t.id === freshActiveTabId);
 
     try {
       // Validate that we have proper tab data before saving
-      const validTabs = tabs.filter(tab => tab && tab.id && tab.cwd);
+      const validTabs = freshTabs.filter(tab => tab && tab.id && tab.cwd);
 
       if (validTabs.length === 0) {
         console.warn('No valid tabs to save to cache');
         return;
       }
 
+      // Get actual window bounds from the main process
+      let windowState = { x: 0, y: 0, width: 1200, height: 800, isMaximized: false };
+      try {
+        const bounds = await window.ipcRenderer.invoke('get-window-bounds') as { x: number; y: number; width: number; height: number; isMaximized: boolean } | null;
+        if (bounds) {
+          windowState = bounds;
+        }
+      } catch {
+        // Use defaults if IPC fails
+      }
+
       await window.cacheApi.save({
         windowId: winId,
         timestamp: Date.now(),
-        windowState: {
-          x: 0,
-          y: 0,
-          width: 1200,
-          height: 800,
-          isMaximized: false
-        },
+        windowState,
         tabs: validTabs.map(tab => ({
           id: tab.id,
           title: tab.title || tab.cwd.split('/').pop() || 'unknown',
@@ -68,31 +81,85 @@ export const useDirectorySync = () => {
     } catch (error) {
       console.warn('Failed to save cache:', error);
     }
-  }, [tabs, cacheEnabled, getWindowId]);
+  }, [cacheEnabled, getWindowId]);
 
+  // Debounced save: coalesces rapid tab mutations into a single cache write
+  const debouncedSaveCache = useCallback(() => {
+    if (saveCacheTimeoutRef.current) {
+      clearTimeout(saveCacheTimeoutRef.current);
+    }
+    saveCacheTimeoutRef.current = setTimeout(() => {
+      saveCache();
+      saveCacheTimeoutRef.current = null;
+    }, 300);
+  }, [saveCache]);
+
+  // Notify the main process of active tab changes so it can persist on window close
+  useEffect(() => {
+    if (!isInitialized || !activeTabId) return;
+    window.ipcRenderer.invoke('set-active-tab', activeTabId).catch(() => {});
+  }, [activeTabId, isInitialized]);
+
+  // Save cache whenever tab metadata changes (add, remove, reorder, active tab)
+  const prevTabSnapshotRef = useRef('');
   useEffect(() => {
     if (!isInitialized || tabs.length === 0) return;
 
+    // Create a snapshot of tab IDs + order + activeTabId to detect changes
+    const snapshot = tabs.map(t => t.id).join(',') + '|' + activeTabId;
+    if (prevTabSnapshotRef.current && snapshot !== prevTabSnapshotRef.current) {
+      debouncedSaveCache();
+    }
+    prevTabSnapshotRef.current = snapshot;
+  }, [tabs, activeTabId, isInitialized, debouncedSaveCache]);
+
+  // Cleanup debounce timer on unmount
+  useEffect(() => {
+    return () => {
+      if (saveCacheTimeoutRef.current) {
+        clearTimeout(saveCacheTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isInitialized) return;
+
     const interval = setInterval(async () => {
+      const { tabs: freshTabs } = useTerminalStore.getState();
+      if (freshTabs.length === 0) return;
+
       try {
         let changed = false;
-        // Query each tab's directory from the shell
-        await Promise.all(tabs.map(async tab => {
+        // Query each tab's panes for directory changes
+        await Promise.all(freshTabs.map(async tab => {
           // Skip welcome tabs
           if (tab.type === 'welcome') return;
 
-          try {
-            // Use query-cwd to actively poll the shell for current directory
-            const currentCwd = (await window.ipcRenderer.invoke('query-cwd', tab.id)) as string;
-            if (currentCwd && currentCwd !== tab.cwd) {
-              const dirName = getDirectoryName(currentCwd, homeDir);
-              console.log(`[DirectorySync] Tab ${tab.id} directory changed: ${tab.cwd} -> ${currentCwd}`);
-              updateTab(tab.id, { cwd: currentCwd, title: dirName });
-              changed = true;
+          // Get panes for this tab (synthesizes single-pane array for legacy tabs)
+          const panes = tab.panes && tab.panes.length > 0
+            ? tab.panes
+            : [{ id: tab.id, cwd: tab.cwd, isReady: tab.isReady }];
+
+          await Promise.all(panes.map(async pane => {
+            try {
+              const currentCwd = (await window.ipcRenderer.invoke('query-cwd', pane.id)) as string;
+              if (currentCwd && currentCwd !== pane.cwd) {
+                console.log(`[DirectorySync] Pane ${pane.id} directory changed: ${pane.cwd} -> ${currentCwd}`);
+                updatePane(tab.id, pane.id, { cwd: currentCwd });
+                // Read fresh activePaneId from the store (closure snapshot may be stale)
+                const freshTab = useTerminalStore.getState().tabs.find(t => t.id === tab.id);
+                const activePaneId = freshTab?.activePaneId || tab.id;
+                if (pane.id === activePaneId) {
+                  const dirName = getDirectoryName(currentCwd, homeDir);
+                  updateTab(tab.id, { cwd: currentCwd, title: dirName });
+                }
+                changed = true;
+              }
+            } catch (error) {
+              console.warn(`Failed to sync directory for pane ${pane.id}:`, error);
             }
-          } catch (error) {
-            console.warn(`Failed to sync directory for tab ${tab.id}:`, error);
-          }
+          }));
         }));
 
         if (changed && !hasChangesRef.current) {
@@ -109,5 +176,5 @@ export const useDirectorySync = () => {
     return () => {
       clearInterval(interval);
     };
-  }, [tabs, isInitialized, updateTab, getDirectoryName, homeDir, cacheEnabled, saveCache]);
+  }, [isInitialized, updateTab, updatePane, getDirectoryName, homeDir, saveCache]);
 };

@@ -1,11 +1,33 @@
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, webContents, dialog } from 'electron'
 import path from 'node:path'
+import fs from 'node:fs/promises'
 import os from 'node:os'
+import crypto from 'node:crypto'
 import * as pty from 'node-pty'
 import { autoUpdater } from 'electron-updater'
 import log from 'electron-log'
 import { cacheManager } from './cache/cacheManager'
-import { scheduleCacheSave, forceSave, saveAllWindows } from './cache/cacheWorker'
+import { scheduleCacheSave, forceSave } from './cache/cacheWorker'
+import { AiToolMonitor } from './aiToolMonitor'
+// AI settings manager — lazy-loaded to ensure app is ready before accessing userData path
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _aiManager: any = null
+function getAiManager() {
+    if (!_aiManager) {
+        _aiManager = require('./ai/aiSettingsManager').aiSettingsManager
+    }
+    return _aiManager
+}
+
+// Git manager — lazy-loaded to ensure app is ready before accessing userData path
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _gitManager: any = null
+function getGitManager() {
+    if (!_gitManager) {
+        _gitManager = require('./git/gitManager').gitManager
+    }
+    return _gitManager
+}
 
 // Configure Logger
 log.transports.file.level = 'info';
@@ -14,8 +36,20 @@ autoUpdater.logger = log;
 // Track PTY instances and directories per terminal tab
 const tabPtys: Map<string, pty.IPty> = new Map()
 const tabDirectories: Map<string, string> = new Map()
+const tabPreviousDirectories: Map<string, string> = new Map()
 // Track which window owns which tab (Tab ID -> Window WebContents ID)
 const tabWindows: Map<string, number> = new Map()
+
+// AI tool completion monitor — broadcast to ALL windows so the toast appears
+// regardless of which window the tab belongs to
+const aiToolMonitor = new AiToolMonitor((event) => {
+    console.log('[Main] AI tool completed, broadcasting to all windows:', event.tabId, event.displayName)
+    for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+            win.webContents.send('ai-tool-completed', event)
+        }
+    }
+})
 
 // Set app identity early
 app.setName('Minty');
@@ -32,6 +66,8 @@ const iconPath = path.resolve(process.env.VITE_PUBLIC || '', 'logo.png');
 // Keep track of all windows to close app when all are closed
 const windows = new Set<BrowserWindow>();
 const windowTabIds: Map<number, string[]> = new Map();
+// Track the active tab ID per window so it can be persisted on close
+const windowActiveTabId: Map<number, string> = new Map();
 
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 
@@ -183,7 +219,7 @@ function sendToWindow(tabId: string, channel: string, ...args: any[]) {
     const webContentsId = tabWindows.get(tabId);
     if (webContentsId) {
         try {
-            const contents = electron.webContents.fromId(webContentsId);
+            const contents = webContents.fromId(webContentsId);
             if (contents && !contents.isDestroyed()) {
                 contents.send(channel, ...args);
             }
@@ -193,16 +229,40 @@ function sendToWindow(tabId: string, channel: string, ...args: any[]) {
     }
 }
 
-// Need to import electron to use webContents.fromId later if not imported top-level
-import electron from 'electron';
+function loadDevUrl(win: BrowserWindow, urlSuffix: string = '') {
+    const fallbackUrl = 'http://localhost:5173';
+    const baseUrl = VITE_DEV_SERVER_URL || fallbackUrl;
+    const fullUrl = urlSuffix ? `${baseUrl}${urlSuffix}` : baseUrl;
+
+    let retries = 0;
+    const maxRetries = 10;
+
+    const tryLoad = () => {
+        if (win.isDestroyed()) return;
+        console.log(`Loading from ${fullUrl} (attempt ${retries + 1})`);
+        win.loadURL(fullUrl).catch((err: Error) => {
+            retries++;
+            if (retries < maxRetries && !win.isDestroyed()) {
+                console.log(`[Main] Load failed (${err.message}), retrying in 500ms...`);
+                setTimeout(tryLoad, 500);
+            } else {
+                console.error(`[Main] Failed to load ${fullUrl} after ${retries} attempts`);
+                if (!win.isDestroyed()) win.show();
+            }
+        });
+    };
+    tryLoad();
+}
 
 function createWindow() {
     const win = new BrowserWindow({
         title: 'Minty',
         icon: iconPath,
+        width: 1200,
+        height: 800,
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
-            nodeIntegration: true,
+            nodeIntegration: false,
             contextIsolation: true,
         },
         frame: false,
@@ -228,17 +288,21 @@ function createWindow() {
         }
     })
 
-    if (VITE_DEV_SERVER_URL) {
-        win.loadURL(VITE_DEV_SERVER_URL)
+    // Log renderer crashes
+    win.webContents.on('render-process-gone', (_event, details) => {
+        console.error('[Main] Renderer process gone:', details.reason, details.exitCode);
+    });
+
+    win.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+        console.error('[Main] Page failed to load:', errorCode, errorDescription);
+    });
+
+    if (app.isPackaged) {
+        win.loadFile(path.join(process.env.DIST || '', 'index.html'));
     } else {
-        // Fallback for dev environment without env var
-        if (!app.isPackaged) {
-            const fallbackUrl = 'http://localhost:5173';
-            win.loadURL(fallbackUrl);
-            console.log('Loading from ' + fallbackUrl + ' (fallback)');
-        } else {
-            win.loadFile(path.join(process.env.DIST || '', 'index.html'))
-        }
+        loadDevUrl(win);
+        // Open DevTools in dev mode so renderer errors are visible
+        win.webContents.openDevTools();
     }
 
     win.once('ready-to-show', () => {
@@ -275,6 +339,7 @@ function createWindow() {
             const isMaximized = win.isMaximized();
 
             if (windowTabIdsList && windowTabIdsList.length > 0) {
+                const activeId = windowActiveTabId.get(windowId) || '';
                 const tabs: any[] = [];
                 for (const tabId of windowTabIdsList) {
                     const cwd = tabDirectories.get(tabId);
@@ -284,7 +349,7 @@ function createWindow() {
                             id: tabId,
                             title: cwd.split('/').pop() || 'unknown',
                             cwd: cwd,
-                            isActive: false,
+                            isActive: tabId === activeId,
                             type: 'terminal' as const
                         });
                     }
@@ -301,11 +366,12 @@ function createWindow() {
                         isMaximized
                     },
                     tabs,
-                    activeTabId: ''
+                    activeTabId: activeId
                 }).catch(err => {
                     console.warn('[Main] Failed to save cache on window close:', err);
                 });
             }
+            windowActiveTabId.delete(windowId);
         } catch (error) {
             console.warn('[Main] Error saving window state on close:', error);
         }
@@ -349,7 +415,16 @@ ipcMain.on('window-close', (event) => {
 // Create new window handler
 ipcMain.handle('create-new-window', async () => {
     try {
-        const newWin = createWindow(); // Use same function
+        const newWin = createWindow();
+
+        // Safety: force-show if ready-to-show never fires
+        setTimeout(() => {
+            if (!newWin.isDestroyed() && !newWin.isVisible()) {
+                console.warn('[Main] New window ready-to-show timeout — force-showing');
+                newWin.show();
+            }
+        }, 8000);
+
         return { success: true, windowId: newWin.id };
     } catch (error) {
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
@@ -359,12 +434,24 @@ ipcMain.handle('create-new-window', async () => {
 // Create new tab handler
 ipcMain.handle('create-new-tab', async (event) => {
     try {
-        const tabId = Date.now().toString();
+        const tabId = crypto.randomUUID();
         const homeDir = os.homedir();
         tabDirectories.set(tabId, homeDir);
 
         // Register window mapping
         tabWindows.set(tabId, event.sender.id);
+
+        // Register with windowTabIds for cache tracking
+        const win = BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+            const windowId = win.id;
+            const ids = windowTabIds.get(windowId) || [];
+            if (!ids.includes(tabId)) {
+                ids.push(tabId);
+                windowTabIds.set(windowId, ids);
+                console.log('[Main] Auto-registered new tab', tabId, 'for window', windowId, '- total tabs:', ids.length);
+            }
+        }
 
         const shell = getDefaultShell();
         const env = buildEnv();
@@ -378,28 +465,29 @@ ipcMain.handle('create-new-tab', async (event) => {
         });
 
         tabPtys.set(tabId, ptyProcess);
+        aiToolMonitor.startMonitoring(tabId, (ptyProcess as any).pid);
 
         ptyProcess.onData((data) => {
             sendToWindow(tabId, 'pty-output', { tabId, data });
         });
 
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(tabId);
             sendToWindow(tabId, 'pty-exit', { tabId, exitCode });
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
         });
 
-        // Send tab-created event to renderer
-        event.sender.send('tab-created', tabId, homeDir, homeDir.split('/').pop() || 'home');
-
-        return { success: true, tabId, cwd: homeDir };
+        return { success: true, tabId, cwd: homeDir, title: homeDir.split('/').pop() || 'home' };
     } catch (error) {
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
 
-// Old window handlers removed
-
+// Get the number of open windows
+ipcMain.handle('get-window-count', () => {
+    return BrowserWindow.getAllWindows().length;
+});
 
 // Get home directory
 ipcMain.handle('get-home-directory', () => {
@@ -410,6 +498,20 @@ ipcMain.handle('get-home-directory', () => {
 ipcMain.handle('get-window-id', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     return win ? win.id : null;
+});
+
+// Get current window bounds and state
+ipcMain.handle('get-window-bounds', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return null;
+    const bounds = win.getBounds();
+    return {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        isMaximized: win.isMaximized()
+    };
 });
 
 // Get current working directory for a tab
@@ -424,23 +526,44 @@ ipcMain.handle('query-cwd', async (_event, tabId: string) => {
         return tabDirectories.get(tabId) || os.homedir();
     }
 
-    // For Linux: use /proc to read shell's cwd (completely invisible!)
-    if (process.platform === 'linux') {
-        try {
-            const pid = (ptyProcess as any).pid;
-            if (pid) {
+    const pid = (ptyProcess as any).pid;
+    if (pid) {
+        // Linux: use /proc to read shell's cwd (completely invisible)
+        if (process.platform === 'linux') {
+            try {
                 const fs = await import('node:fs/promises');
-                // Read /proc/[pid]/cwd symlink which points to current working directory
                 const cwd = await fs.readlink(`/proc/${pid}/cwd`);
                 if (cwd && cwd !== tabDirectories.get(tabId)) {
                     console.log('[Main] Directory changed for tab', tabId, ':', cwd);
                     tabDirectories.set(tabId, cwd);
                 }
                 return cwd;
+            } catch (error) {
+                console.warn('[Main] Failed to read /proc for tab', tabId, ':', error);
             }
-        } catch (error) {
-            // Fallback to tracked directory if /proc reading fails
-            console.warn('[Main] Failed to read /proc for tab', tabId, ':', error);
+        }
+
+        // macOS: use lsof to find the cwd of the process
+        if (process.platform === 'darwin') {
+            try {
+                const cp = await import('node:child_process');
+                const cwd = await new Promise<string | null>((resolve) => {
+                    cp.exec(`lsof -p ${pid} -Fn | grep '^fcwd$' -A1 | grep '^n' | cut -c2-`, { timeout: 2000 }, (err, stdout) => {
+                        if (err || !stdout.trim()) {
+                            resolve(null);
+                        } else {
+                            resolve(stdout.trim());
+                        }
+                    });
+                });
+                if (cwd && cwd !== tabDirectories.get(tabId)) {
+                    console.log('[Main] Directory changed for tab', tabId, ':', cwd);
+                    tabDirectories.set(tabId, cwd);
+                }
+                if (cwd) return cwd;
+            } catch (error) {
+                console.warn('[Main] Failed to query cwd via lsof for tab', tabId, ':', error);
+            }
         }
     }
 
@@ -454,7 +577,104 @@ ipcMain.handle('set-cwd', (_event, tabId: string, cwd: string) => {
     return cwd;
 });
 
-// Create persistent PTY session for a tab
+// Select directory dialog
+ipcMain.handle('select-directory', async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+        properties: ['openDirectory', 'createDirectory'],
+        title: 'Select Directory',
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+});
+
+// List directory contents
+ipcMain.handle('list-directory', async (_event, dirPath: string, options?: { showHidden?: boolean }) => {
+    try {
+        const resolvedPath = dirPath.startsWith('~')
+            ? path.join(os.homedir(), dirPath.slice(1))
+            : dirPath;
+
+        const dirents = await fs.readdir(resolvedPath, { withFileTypes: true });
+
+        const entries = await Promise.all(
+            dirents
+                .filter((dirent) => options?.showHidden || !dirent.name.startsWith('.'))
+                .map(async (dirent) => {
+                    const fullPath = path.join(resolvedPath, dirent.name);
+                    let size = 0;
+                    let modifiedAt = 0;
+                    try {
+                        const stat = await fs.stat(fullPath);
+                        size = stat.size;
+                        modifiedAt = stat.mtimeMs;
+                    } catch {
+                        // stat may fail for broken symlinks
+                    }
+                    return {
+                        name: dirent.name,
+                        path: fullPath,
+                        isDirectory: dirent.isDirectory(),
+                        isSymlink: dirent.isSymbolicLink(),
+                        size,
+                        modifiedAt,
+                    };
+                })
+        );
+
+        return { success: true, path: resolvedPath, entries };
+    } catch (error: any) {
+        return { success: false, entries: [], error: error.message };
+    }
+});
+
+// Read file contents for the code editor
+ipcMain.handle('read-file', async (_event, filePath: string) => {
+    try {
+        const resolvedPath = filePath.startsWith('~')
+            ? path.join(os.homedir(), filePath.slice(1))
+            : filePath;
+
+        // Check file size first (reject files > 5MB)
+        const stat = await fs.stat(resolvedPath);
+        if (stat.size > 5 * 1024 * 1024) {
+            return { success: false, error: 'File too large (>5MB)', path: resolvedPath };
+        }
+
+        // Read first 8KB to detect binary files
+        const fileHandle = await fs.open(resolvedPath, 'r');
+        const checkBuffer = Buffer.alloc(Math.min(8192, stat.size));
+        await fileHandle.read(checkBuffer, 0, checkBuffer.length, 0);
+        await fileHandle.close();
+
+        // Check for null bytes (binary indicator)
+        for (let i = 0; i < checkBuffer.length; i++) {
+            if (checkBuffer[i] === 0) {
+                return { success: false, error: 'Binary file cannot be opened in editor', path: resolvedPath };
+            }
+        }
+
+        const content = await fs.readFile(resolvedPath, 'utf-8');
+        return { success: true, content, path: resolvedPath };
+    } catch (error: any) {
+        return { success: false, error: error.message, path: filePath };
+    }
+});
+
+// Write file contents from the code editor
+ipcMain.handle('write-file', async (_event, filePath: string, content: string) => {
+    try {
+        const resolvedPath = filePath.startsWith('~')
+            ? path.join(os.homedir(), filePath.slice(1))
+            : filePath;
+        await fs.writeFile(resolvedPath, content, 'utf-8');
+        return { success: true };
+    } catch (error: any) {
+        return { success: false, error: error.message };
+    }
+});
+
 // Create persistent PTY session for a tab
 ipcMain.handle('create-pty-session', (event, tabId: string, cwd?: string) => {
     // Kill existing PTY if any
@@ -472,6 +692,18 @@ ipcMain.handle('create-pty-session', (event, tabId: string, cwd?: string) => {
     // Register window
     tabWindows.set(tabId, event.sender.id);
 
+    // Register with windowTabIds for cache tracking
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        const windowId = win.id;
+        const ids = windowTabIds.get(windowId) || [];
+        if (!ids.includes(tabId)) {
+            ids.push(tabId);
+            windowTabIds.set(windowId, ids);
+            console.log('[Main] Auto-registered pty-session tab', tabId, 'for window', windowId, '- total tabs:', ids.length);
+        }
+    }
+
     const shell = getDefaultShell();
     const env = buildEnv();
 
@@ -485,6 +717,7 @@ ipcMain.handle('create-pty-session', (event, tabId: string, cwd?: string) => {
         });
 
         tabPtys.set(tabId, ptyProcess);
+        aiToolMonitor.startMonitoring(tabId, (ptyProcess as any).pid);
 
         // Stream output to renderer
         ptyProcess.onData((data) => {
@@ -493,6 +726,7 @@ ipcMain.handle('create-pty-session', (event, tabId: string, cwd?: string) => {
 
         // Handle PTY exit
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(tabId);
             sendToWindow(tabId, 'pty-exit', { tabId, exitCode });
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
@@ -524,7 +758,6 @@ ipcMain.handle('create-pty-session', (event, tabId: string, cwd?: string) => {
     }
 });
 
-// Initialize a new tab (legacy support + creates PTY)
 // Initialize a new tab (legacy support + creates PTY)
 ipcMain.handle('init-tab', (event, tabId: string, cwd?: string) => {
     // Use provided cwd or default to home directory
@@ -568,12 +801,14 @@ ipcMain.handle('init-tab', (event, tabId: string, cwd?: string) => {
         });
 
         tabPtys.set(tabId, ptyProcess);
+        aiToolMonitor.startMonitoring(tabId, (ptyProcess as any).pid);
 
         ptyProcess.onData((data) => {
             sendToWindow(tabId, 'pty-output', { tabId, data });
         });
 
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(tabId);
             sendToWindow(tabId, 'pty-exit', { tabId, exitCode });
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
@@ -605,6 +840,7 @@ ipcMain.handle('init-tab', (event, tabId: string, cwd?: string) => {
 
 // Remove tab and cleanup PTY
 ipcMain.handle('remove-tab', (event, tabId: string) => {
+    aiToolMonitor.stopMonitoring(tabId);
     const ptyProcess = tabPtys.get(tabId);
     if (ptyProcess) {
         ptyProcess.kill();
@@ -678,6 +914,32 @@ ipcMain.handle('send-signal', (_event, tabId: string, signal: string) => {
     return { success: false };
 });
 
+// AI tool monitor settings
+ipcMain.handle('ai-tool-monitor-set-enabled', (_event, enabled: boolean) => {
+    aiToolMonitor.setEnabled(enabled);
+    return { success: true };
+});
+
+ipcMain.handle('ai-tool-monitor-get-enabled', () => {
+    return aiToolMonitor.isEnabled();
+});
+
+// Test handler: fire a fake AI tool completion event to verify toast pipeline
+ipcMain.handle('ai-tool-monitor-test', (event) => {
+    const testEvent = {
+        tabId: 'test',
+        toolName: 'claude',
+        displayName: 'Claude Code',
+        durationMs: 45000,
+    };
+    console.log('[Main] Firing test AI tool completion event');
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) {
+        win.webContents.send('ai-tool-completed', testEvent);
+    }
+    return { success: true };
+});
+
 // Execute command (legacy mode - non-interactive, returns when complete)
 ipcMain.handle('execute-command', async (_event, command: string, tabId: string) => {
     const cwd = tabDirectories.get(tabId) || os.homedir();
@@ -692,13 +954,9 @@ ipcMain.handle('execute-command', async (_event, command: string, tabId: string)
         if (targetPath === '' || targetPath === '~') {
             newPath = os.homedir();
         } else if (targetPath === '-') {
-            newPath = cwd;
-        } else if (targetPath.startsWith('~')) {
-            if (targetPath === '~' || targetPath === '~/') {
-                newPath = os.homedir();
-            } else {
-                newPath = path.join(os.homedir(), targetPath.slice(2));
-            }
+            newPath = tabPreviousDirectories.get(tabId) || cwd;
+        } else if (targetPath.startsWith('~/')) {
+            newPath = path.join(os.homedir(), targetPath.slice(2));
         } else if (path.isAbsolute(targetPath)) {
             newPath = targetPath;
         } else {
@@ -716,6 +974,7 @@ ipcMain.handle('execute-command', async (_event, command: string, tabId: string)
                     cwd: cwd
                 };
             }
+            tabPreviousDirectories.set(tabId, cwd);
             tabDirectories.set(tabId, newPath);
             return {
                 success: true,
@@ -855,6 +1114,96 @@ ipcMain.handle('get-system-info', () => {
     };
 });
 
+// Track previous CPU times for delta-based usage calculation
+let prevCpuIdle = 0;
+let prevCpuTotal = 0;
+
+// Get real-time system stats (battery, wifi, cpu, memory)
+ipcMain.handle('get-system-stats', async () => {
+    // CPU usage (delta between calls)
+    const cpus = os.cpus();
+    let idle = 0;
+    let total = 0;
+    for (const cpu of cpus) {
+        idle += cpu.times.idle;
+        total += cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.idle + cpu.times.irq;
+    }
+    let cpuUsage = 0;
+    if (prevCpuTotal > 0) {
+        const idleDiff = idle - prevCpuIdle;
+        const totalDiff = total - prevCpuTotal;
+        cpuUsage = totalDiff > 0 ? Math.round((1 - idleDiff / totalDiff) * 100) : 0;
+    }
+    prevCpuIdle = idle;
+    prevCpuTotal = total;
+
+    // Memory
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const memoryUsage = Math.round(((totalMem - freeMem) / totalMem) * 100);
+
+    // Battery (Linux: /sys/class/power_supply/BAT*)
+    let battery = { level: 100, charging: false, available: false };
+    for (const batName of ['BAT0', 'BAT1', 'BAT2', 'BATT', 'battery']) {
+        try {
+            const batPath = `/sys/class/power_supply/${batName}`;
+            const capacity = await fs.readFile(`${batPath}/capacity`, 'utf-8');
+            const status = await fs.readFile(`${batPath}/status`, 'utf-8');
+            battery = {
+                level: parseInt(capacity.trim(), 10),
+                charging: status.trim() === 'Charging' || status.trim() === 'Full',
+                available: true
+            };
+            break;
+        } catch {
+            // Try next battery name
+        }
+    }
+
+    // WiFi signal (Linux: /proc/net/wireless)
+    let wifi = { connected: true, quality: 0, strength: 'unknown' as string, available: false };
+    try {
+        const wireless = await fs.readFile('/proc/net/wireless', 'utf-8');
+        const lines = wireless.trim().split('\n');
+        if (lines.length > 2) {
+            const dataLine = lines[2].trim();
+            const parts = dataLine.split(/\s+/);
+            const linkQuality = parseFloat(parts[2]); // 0-70 typically
+            const qualityPercent = Math.min(100, Math.round((linkQuality / 70) * 100));
+            wifi = {
+                connected: true,
+                quality: qualityPercent,
+                strength: qualityPercent > 65 ? 'strong' : qualityPercent > 35 ? 'moderate' : 'weak',
+                available: true
+            };
+        }
+    } catch {
+        // No wireless interface or not on Linux — fallback
+    }
+
+    // If no wifi data from /proc, check basic network connectivity
+    if (!wifi.available) {
+        try {
+            const { execSync } = await import('node:child_process');
+            const result = execSync('nmcli -t -f SIGNAL,ACTIVE dev wifi', { timeout: 2000 }).toString();
+            const activeLine = result.split('\n').find(l => l.endsWith(':yes'));
+            if (activeLine) {
+                const signal = parseInt(activeLine.split(':')[0], 10);
+                wifi = {
+                    connected: true,
+                    quality: signal,
+                    strength: signal > 65 ? 'strong' : signal > 35 ? 'moderate' : 'weak',
+                    available: true
+                };
+            }
+        } catch {
+            // nmcli not available or no wifi
+        }
+    }
+
+    return { cpuUsage, memoryUsage, battery, wifi };
+});
+
 // Get current tabs for saving
 ipcMain.handle('get-current-tabs', () => {
     const tabs: any[] = [];
@@ -881,14 +1230,25 @@ ipcMain.handle('save-to-library', async (_event: any, _libraryItem: unknown) => 
 });
 
 // Open tab with specific directory
-// Open tab with specific directory
 ipcMain.handle('open-tab-with-directory', async (event: any, cwd: string, title?: string) => {
     try {
-        const newId = Date.now().toString();
+        const newId = crypto.randomUUID();
         tabDirectories.set(newId, cwd);
 
         // Register window
         tabWindows.set(newId, event.sender.id);
+
+        // Register with windowTabIds for cache tracking
+        const win = BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+            const windowId = win.id;
+            const ids = windowTabIds.get(windowId) || [];
+            if (!ids.includes(newId)) {
+                ids.push(newId);
+                windowTabIds.set(windowId, ids);
+                console.log('[Main] Auto-registered directory tab', newId, 'for window', windowId, '- total tabs:', ids.length);
+            }
+        }
 
         const shell = getDefaultShell();
         const env = buildEnv();
@@ -902,12 +1262,14 @@ ipcMain.handle('open-tab-with-directory', async (event: any, cwd: string, title?
         });
 
         tabPtys.set(newId, ptyProcess);
+        aiToolMonitor.startMonitoring(newId, (ptyProcess as any).pid);
 
         ptyProcess.onData((data) => {
             sendToWindow(newId, 'pty-output', { tabId: newId, data });
         });
 
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(newId);
             sendToWindow(newId, 'pty-exit', { tabId: newId, exitCode });
             tabPtys.delete(newId);
             tabWindows.delete(newId);
@@ -1158,11 +1520,16 @@ ipcMain.handle('cache-get-state', async () => {
     }
 });
 
-ipcMain.handle('cache-save', async (_event, entry: any) => {
+ipcMain.handle('cache-save', async (event, entry: any) => {
     try {
         const settings = cacheManager.getSettings();
         if (!settings.enabled) {
             return { success: true, skipped: true };
+        }
+        // Override windowId with authoritative value from sender
+        const win = BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+            entry.windowId = win.id;
         }
         scheduleCacheSave(entry);
         return { success: true };
@@ -1226,8 +1593,19 @@ ipcMain.handle('cache-clear', async (_event, windowId?: number) => {
     }
 });
 
-ipcMain.handle('cache-register-tab', async (_event, windowId: number, tabId: string) => {
+ipcMain.handle('set-active-tab', async (event, tabId: string) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        windowActiveTabId.set(win.id, tabId);
+    }
+    return { success: true };
+});
+
+ipcMain.handle('cache-register-tab', async (event, _windowId: number, tabId: string) => {
     try {
+        // Derive window ID from event.sender (authoritative) instead of trusting renderer
+        const win = BrowserWindow.fromWebContents(event.sender);
+        const windowId = win ? win.id : _windowId;
         const ids = windowTabIds.get(windowId) || [];
         if (!ids.includes(tabId)) {
             ids.push(tabId);
@@ -1258,6 +1636,135 @@ ipcMain.handle('cache-unregister-tab', async (_event, windowId: number, tabId: s
     }
 });
 
+// ── AI Settings IPC Handlers ──────────────────────────────────────────
+
+ipcMain.handle('ai-get-settings', async () => {
+    return getAiManager().loadSettings();
+});
+
+ipcMain.handle('ai-set-settings', async (_event, settings: any) => {
+    await getAiManager().saveSettings(settings);
+    return { success: true };
+});
+
+ipcMain.handle('ai-test-connection', async (_event, settings: any) => {
+    return getAiManager().testConnection(settings);
+});
+
+ipcMain.handle('ai-enhance-command', async (_event, request: { command: string }) => {
+    return getAiManager().enhanceCommand(request.command);
+});
+
+// ── Git IPC Handlers ─────────────────────────────────────────────────
+
+ipcMain.handle('git-is-repo', async (_event, cwd: string) => {
+    return getGitManager().isGitRepo(cwd);
+});
+
+ipcMain.handle('git-init', async (_event, cwd: string) => {
+    return getGitManager().initRepo(cwd);
+});
+
+ipcMain.handle('git-status', async (_event, cwd: string) => {
+    return getGitManager().getStatus(cwd);
+});
+
+ipcMain.handle('git-log', async (_event, cwd: string, limit?: number) => {
+    return getGitManager().getLog(cwd, limit);
+});
+
+ipcMain.handle('git-diff', async (_event, cwd: string, staged?: boolean) => {
+    return getGitManager().getDiff(cwd, staged);
+});
+
+ipcMain.handle('git-diff-file', async (_event, cwd: string, file: string, staged?: boolean) => {
+    return getGitManager().getFileDiff(cwd, file, staged);
+});
+
+ipcMain.handle('git-stage', async (_event, cwd: string, files: string[]) => {
+    return getGitManager().stageFiles(cwd, files);
+});
+
+ipcMain.handle('git-unstage', async (_event, cwd: string, files: string[]) => {
+    return getGitManager().unstageFiles(cwd, files);
+});
+
+ipcMain.handle('git-stage-all', async (_event, cwd: string) => {
+    return getGitManager().stageAll(cwd);
+});
+
+ipcMain.handle('git-commit', async (_event, cwd: string, message: string) => {
+    return getGitManager().commit(cwd, message);
+});
+
+ipcMain.handle('git-push', async (_event, cwd: string, remote?: string, branch?: string) => {
+    return getGitManager().push(cwd, remote, branch);
+});
+
+ipcMain.handle('git-pull', async (_event, cwd: string, remote?: string, branch?: string) => {
+    return getGitManager().pull(cwd, remote, branch);
+});
+
+ipcMain.handle('git-branches', async (_event, cwd: string) => {
+    return getGitManager().getBranches(cwd);
+});
+
+ipcMain.handle('git-branch-create', async (_event, cwd: string, name: string) => {
+    return getGitManager().createBranch(cwd, name);
+});
+
+ipcMain.handle('git-branch-switch', async (_event, cwd: string, name: string) => {
+    return getGitManager().switchBranch(cwd, name);
+});
+
+ipcMain.handle('git-branch-delete', async (_event, cwd: string, name: string, force?: boolean) => {
+    return getGitManager().deleteBranch(cwd, name, force);
+});
+
+ipcMain.handle('git-branch-merge', async (_event, cwd: string, branch: string) => {
+    return getGitManager().mergeBranch(cwd, branch);
+});
+
+ipcMain.handle('git-remotes', async (_event, cwd: string) => {
+    return getGitManager().getRemotes(cwd);
+});
+
+ipcMain.handle('git-remote-add', async (_event, cwd: string, name: string, url: string) => {
+    return getGitManager().addRemote(cwd, name, url);
+});
+
+ipcMain.handle('git-remote-remove', async (_event, cwd: string, name: string) => {
+    return getGitManager().removeRemote(cwd, name);
+});
+
+ipcMain.handle('git-remote-set-url', async (_event, cwd: string, name: string, url: string) => {
+    return getGitManager().setRemoteUrl(cwd, name, url);
+});
+
+ipcMain.handle('git-clone', async (_event, url: string, targetDir: string, options?: { depth?: number }) => {
+    return getGitManager().clone(url, targetDir, options);
+});
+
+ipcMain.handle('github-connect-pat', async (_event, token: string) => {
+    return getGitManager().saveGitHubAuth(token, 'pat');
+});
+
+ipcMain.handle('github-disconnect', async () => {
+    return getGitManager().disconnectGitHub();
+});
+
+ipcMain.handle('github-get-auth', async () => {
+    return getGitManager().loadGitHubAuth();
+});
+
+ipcMain.handle('github-list-repos', async (_event, page?: number, perPage?: number) => {
+    return getGitManager().listGitHubRepos(page, perPage);
+});
+
+ipcMain.handle('github-search-repos', async (_event, query: string) => {
+    return getGitManager().searchGitHubRepos(query);
+});
+
 // Create a new Minty window with specific tabs
 ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
     console.log('[IPC] create-window-with-tabs called with tabs:', tabs);
@@ -1267,7 +1774,7 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
             icon: iconPath,
             webPreferences: {
                 preload: path.join(__dirname, 'preload.js'),
-                nodeIntegration: true,
+                nodeIntegration: false,
                 contextIsolation: true,
             },
             frame: false,
@@ -1278,17 +1785,12 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
 
         console.log('[IPC] New window created, loading URL...');
 
-        if (VITE_DEV_SERVER_URL) {
-            newWin.loadURL(`${VITE_DEV_SERVER_URL}?libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`);
+        if (app.isPackaged) {
+            newWin.loadFile(path.join(process.env.DIST || '', 'index.html'), {
+                hash: `libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`
+            });
         } else {
-            if (!app.isPackaged) {
-                const fallbackUrl = 'http://localhost:5174';
-                newWin.loadURL(`${fallbackUrl}?libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`);
-            } else {
-                newWin.loadFile(path.join(process.env.DIST || '', 'index.html'), {
-                    hash: `libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`
-                });
-            }
+            loadDevUrl(newWin, `?libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`);
         }
 
         const loadHandler = () => {
@@ -1341,6 +1843,7 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
                 const isMaximized = newWin.isMaximized();
 
                 if (windowTabIdsList.length > 0) {
+                    const activeId = windowActiveTabId.get(windowId) || '';
                     const cacheTabs: any[] = [];
                     for (const tabId of windowTabIdsList) {
                         const cwd = tabDirectories.get(tabId);
@@ -1349,7 +1852,7 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
                                 id: tabId,
                                 title: cwd.split('/').pop() || 'unknown',
                                 cwd: cwd,
-                                isActive: false,
+                                isActive: tabId === activeId,
                                 type: 'terminal' as const
                             });
                         }
@@ -1366,11 +1869,12 @@ ipcMain.handle('create-window-with-tabs', async (_event, tabs: any[]) => {
                             isMaximized
                         },
                         tabs: cacheTabs,
-                        activeTabId: ''
+                        activeTabId: activeId
                     }).catch(err => {
                         console.warn('[Main] Failed to save cache on window close:', err);
                     });
                 }
+                windowActiveTabId.delete(windowId);
             } catch (error) {
                 console.warn('[Main] Error saving window state on close:', error);
             }
@@ -1397,58 +1901,20 @@ app.on('window-all-closed', async () => {
     });
     tabPtys.clear();
 
-    const entries: any[] = [];
-    for (const win of windows) {
-        // Skip destroyed windows
-        if (win.isDestroyed()) {
-            continue;
-        }
-
-        try {
-            const windowId = win.id;
-            const windowTabIdsList = windowTabIds.get(windowId) || [];
-            const bounds = win.getBounds();
-            const isMaximized = win.isMaximized();
-
-            if (windowTabIdsList.length > 0) {
-                const cacheTabs: any[] = [];
-                for (const tabId of windowTabIdsList) {
-                    const cwd = tabDirectories.get(tabId);
-                    if (cwd) {
-                        cacheTabs.push({
-                            id: tabId,
-                            title: cwd.split('/').pop() || 'unknown',
-                            cwd: cwd,
-                            isActive: false,
-                            type: 'terminal' as const
-                        });
-                    }
-                }
-
-                entries.push({
-                    windowId,
-                    timestamp: Date.now(),
-                    windowState: {
-                        x: bounds.x,
-                        y: bounds.y,
-                        width: bounds.width,
-                        height: bounds.height,
-                        isMaximized
-                    },
-                    tabs: cacheTabs,
-                    activeTabId: ''
-                });
-            }
-        } catch (error) {
-            // Window was destroyed while processing
-            console.warn('[Main] Window destroyed during save:', error);
-        }
+    // The 'close' event on each window already called forceSave() which stored
+    // entries in cacheManager's memory via updateEntry(). By the time
+    // 'window-all-closed' fires, the 'closed' event has already cleared
+    // windowTabIds and windows, so we can't rebuild entries from those maps.
+    // Instead, just flush the in-memory cache to disk.
+    try {
+        await cacheManager.saveCache();
+        console.log('[Main] Cache flushed to disk on app close');
+    } catch (err) {
+        console.warn('[Main] Failed to flush cache on app close:', err);
     }
 
-    await saveAllWindows(entries).catch(err => {
-        console.warn('[Main] Failed to save all windows cache:', err);
-    });
     windowTabIds.clear();
+    windowActiveTabId.clear();
 
     if (process.platform !== 'darwin') {
         app.quit()
@@ -1467,8 +1933,28 @@ app.whenReady().then(async () => {
     const splash = createSplashWindow();
     const mainWin = createWindow();
 
+    // Close splash when main window is ready, with a minimum 1.5s display time
+    const splashStart = Date.now();
+    let shown = false;
+
+    const showMainWindow = () => {
+        if (shown) return;
+        shown = true;
+        const elapsed = Date.now() - splashStart;
+        const remaining = Math.max(0, 1500 - elapsed);
+        setTimeout(() => {
+            if (!splash.isDestroyed()) splash.close();
+            if (!mainWin.isDestroyed() && !mainWin.isVisible()) mainWin.show();
+        }, remaining);
+    };
+
+    mainWin.once('ready-to-show', showMainWindow);
+
+    // Safety: if ready-to-show never fires, force-show after 8 seconds
     setTimeout(() => {
-        splash.close();
-        mainWin?.show();
-    }, 3000);
+        if (!shown) {
+            console.warn('[Main] ready-to-show timeout — force-showing window');
+            showMainWindow();
+        }
+    }, 8000);
 })

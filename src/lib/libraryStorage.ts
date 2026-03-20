@@ -55,11 +55,11 @@ class LibraryStorage {
       // Fallback to localStorage
       const items = await this.getAll();
       const existingIndex = items.findIndex(i => i.id === item.id);
-      
+
       if (existingIndex >= 0) {
-        items[existingIndex] = { ...item, usage: (items[existingIndex].usage || 0) + 1 };
+        items[existingIndex] = item;
       } else {
-        items.push({ ...item, usage: 0 });
+        items.push(item);
       }
       
       localStorage.setItem('minty-library', JSON.stringify(items));

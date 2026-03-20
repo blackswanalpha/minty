@@ -1,7 +1,9 @@
-import { useRef } from "react";
-import { Terminal, X, ChevronLeft, ChevronRight } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { useRef, useState, useEffect } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
+import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
+import { SortableContext, horizontalListSortingStrategy } from "@dnd-kit/sortable";
 import { useTerminalStore } from "@/stores/terminalStore";
+import { SortableTab } from "./SortableTab";
 
 interface TerminalHeaderProps {
   onClear: () => void;
@@ -20,9 +22,25 @@ const formatPath = (fullPath: string, homePath: string): string => {
 export const TerminalHeader = ({
   onClear
 }: TerminalHeaderProps) => {
-  const { tabs, activeTabId, setActiveTab, removeTab, homeDir, getActiveTab } = useTerminalStore();
+  const tabs = useTerminalStore(state => state.tabs);
+  const activeTabId = useTerminalStore(state => state.activeTabId);
+  const setActiveTab = useTerminalStore(state => state.setActiveTab);
+  const removeTab = useTerminalStore(state => state.removeTab);
+  const reorderTabs = useTerminalStore(state => state.reorderTabs);
+  const homeDir = useTerminalStore(state => state.homeDir);
+  const getActiveTab = useTerminalStore(state => state.getActiveTab);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const activeTab = getActiveTab();
+  const [shellName, setShellName] = useState('shell');
+
+  useEffect(() => {
+    window.ipcRenderer.invoke('get-system-info').then((info: any) => {
+      if (info?.shell) {
+        setShellName(info.shell.split('/').pop() || 'shell');
+      }
+    }).catch(() => {});
+  }, []);
 
   // Debug CWD display
   if (activeTab) {
@@ -30,23 +48,40 @@ export const TerminalHeader = ({
   }
 
   const scrollLeft = () => {
-    if (scrollContainerRef.current) {
-      scrollContainerRef.current.scrollBy({ left: -200, behavior: 'smooth' });
-    }
+    scrollContainerRef.current?.scrollBy({ left: -200, behavior: 'smooth' });
   };
 
   const scrollRight = () => {
+    scrollContainerRef.current?.scrollBy({ left: 200, behavior: 'smooth' });
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
     if (scrollContainerRef.current) {
-      scrollContainerRef.current.scrollBy({ left: 200, behavior: 'smooth' });
+      scrollContainerRef.current.scrollLeft += e.deltaY;
     }
   };
 
   const handleCloseTab = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const tab = tabs.find(t => t.id === id);
     try {
-      await window.ipcRenderer.invoke('remove-tab', id);
+      if (tab?.panes && tab.panes.length > 0) {
+        // Clean up all pane PTYs
+        await Promise.all(tab.panes.map(pane =>
+          window.ipcRenderer.invoke('remove-tab', pane.id).catch(() => {})
+        ));
+      } else {
+        await window.ipcRenderer.invoke('remove-tab', id);
+      }
     } catch { /* ignore */ }
     removeTab(id);
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (over && active.id !== over.id) {
+      reorderTabs(active.id as string, over.id as string);
+    }
   };
 
   return (
@@ -61,40 +96,25 @@ export const TerminalHeader = ({
             <ChevronLeft className="w-4 h-4" />
           </button>
 
-          <div
-            ref={scrollContainerRef}
-            className="flex items-center gap-1 overflow-x-hidden no-scrollbar flex-1 scroll-smooth"
-          >
-            {tabs.map((tab) => (
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={tabs.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
               <div
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={cn(
-                  "flex items-center gap-2 px-3 py-1.5 rounded-t border-t border-x cursor-pointer group min-w-[120px] max-w-[200px] shrink-0",
-                  activeTabId === tab.id
-                    ? "bg-card border-border"
-                    : "bg-transparent border-transparent hover:bg-card/50"
-                )}
+                ref={scrollContainerRef}
+                onWheel={handleWheel}
+                className="flex items-center gap-1 overflow-x-scroll scrollbar-none flex-1"
               >
-                <Terminal className={cn("w-3 h-3 shrink-0", activeTabId === tab.id ? "text-primary" : "text-muted-foreground")} />
-                <span className={cn(
-                  "text-xs font-mono truncate flex-1",
-                  activeTabId === tab.id ? "text-foreground" : "text-muted-foreground"
-                )}>
-                  {tab.title}
-                </span>
-                <button
-                  onClick={(e) => handleCloseTab(tab.id, e)}
-                  className={cn(
-                    "opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded-sm hover:bg-secondary",
-                    activeTabId === tab.id ? "opacity-100" : ""
-                  )}
-                >
-                  <X className="w-3 h-3 text-muted-foreground hover:text-foreground" />
-                </button>
+                {tabs.map((tab) => (
+                  <SortableTab
+                    key={tab.id}
+                    tab={tab}
+                    isActive={activeTabId === tab.id}
+                    onActivate={setActiveTab}
+                    onClose={handleCloseTab}
+                  />
+                ))}
               </div>
-            ))}
-          </div>
+            </SortableContext>
+          </DndContext>
 
           <button
             onClick={scrollRight}
@@ -109,7 +129,7 @@ export const TerminalHeader = ({
       <div className="flex items-center gap-4 px-4 py-2 text-sm font-mono border-t border-border/50">
         <span className="text-terminal-green">{formatPath(activeTab?.cwd || '', homeDir)}</span>
         <span className="text-muted-foreground">|</span>
-        <span className="text-primary">bash</span>
+        <span className="text-primary">{shellName}</span>
         <div className="ml-auto flex items-center gap-2">
           <button
             onClick={onClear}

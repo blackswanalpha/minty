@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Search, Folder, FileText, Terminal, GitBranch, Package, Settings, Trash2, Copy, Play, Library as LibraryIcon, FolderOpen, Monitor, Maximize2 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { LibraryStorage, type LibraryItem } from "@/lib/libraryStorage";
+import { useTerminalStore } from "@/stores/terminalStore";
 
 interface LibraryModalProps {
   open: boolean;
@@ -95,8 +96,13 @@ export const LibraryModal = ({ open, onOpenChange }: LibraryModalProps) => {
       await handleOpenInNewWindow(item);
     } else {
       console.log('[LibraryModal] Executing in current terminal...');
+      const activeTabId = useTerminalStore.getState().activeTabId;
+      if (!activeTabId) {
+        console.warn('[LibraryModal] No active tab to execute command in');
+        return;
+      }
       const content = typeof item.content === 'string' ? item.content : JSON.stringify(item.content);
-      window.ipcRenderer.invoke('send-input', 'active', content + '\n');
+      window.ipcRenderer.invoke('send-input', activeTabId, content + '\n');
       await LibraryStorage.save({ ...item, usage: (item.usage || 0) + 1 });
       onOpenChange(false);
     }

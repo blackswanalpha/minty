@@ -38,20 +38,52 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
 const node_path_1 = __importDefault(require("node:path"));
+const promises_1 = __importDefault(require("node:fs/promises"));
 const node_os_1 = __importDefault(require("node:os"));
+const node_crypto_1 = __importDefault(require("node:crypto"));
 const pty = __importStar(require("node-pty"));
 const electron_updater_1 = require("electron-updater");
 const electron_log_1 = __importDefault(require("electron-log"));
 const cacheManager_1 = require("./cache/cacheManager");
 const cacheWorker_1 = require("./cache/cacheWorker");
+const aiToolMonitor_1 = require("./aiToolMonitor");
+// AI settings manager — lazy-loaded to ensure app is ready before accessing userData path
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _aiManager = null;
+function getAiManager() {
+    if (!_aiManager) {
+        _aiManager = require('./ai/aiSettingsManager').aiSettingsManager;
+    }
+    return _aiManager;
+}
+// Git manager — lazy-loaded to ensure app is ready before accessing userData path
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _gitManager = null;
+function getGitManager() {
+    if (!_gitManager) {
+        _gitManager = require('./git/gitManager').gitManager;
+    }
+    return _gitManager;
+}
 // Configure Logger
 electron_log_1.default.transports.file.level = 'info';
 electron_updater_1.autoUpdater.logger = electron_log_1.default;
 // Track PTY instances and directories per terminal tab
 const tabPtys = new Map();
 const tabDirectories = new Map();
+const tabPreviousDirectories = new Map();
 // Track which window owns which tab (Tab ID -> Window WebContents ID)
 const tabWindows = new Map();
+// AI tool completion monitor — broadcast to ALL windows so the toast appears
+// regardless of which window the tab belongs to
+const aiToolMonitor = new aiToolMonitor_1.AiToolMonitor((event) => {
+    console.log('[Main] AI tool completed, broadcasting to all windows:', event.tabId, event.displayName);
+    for (const win of electron_1.BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+            win.webContents.send('ai-tool-completed', event);
+        }
+    }
+});
 // Set app identity early
 electron_1.app.setName('Minty');
 if (process.platform === 'linux') {
@@ -65,6 +97,8 @@ const iconPath = node_path_1.default.resolve(process.env.VITE_PUBLIC || '', 'log
 // Keep track of all windows to close app when all are closed
 const windows = new Set();
 const windowTabIds = new Map();
+// Track the active tab ID per window so it can be persisted on close
+const windowActiveTabId = new Map();
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 // Configure AutoUpdater
 electron_updater_1.autoUpdater.autoDownload = false;
@@ -193,7 +227,7 @@ function sendToWindow(tabId, channel, ...args) {
     const webContentsId = tabWindows.get(tabId);
     if (webContentsId) {
         try {
-            const contents = electron_2.default.webContents.fromId(webContentsId);
+            const contents = electron_1.webContents.fromId(webContentsId);
             if (contents && !contents.isDestroyed()) {
                 contents.send(channel, ...args);
             }
@@ -203,18 +237,43 @@ function sendToWindow(tabId, channel, ...args) {
         }
     }
 }
-// Need to import electron to use webContents.fromId later if not imported top-level
-const electron_2 = __importDefault(require("electron"));
+function loadDevUrl(win, urlSuffix = '') {
+    const fallbackUrl = 'http://localhost:5173';
+    const baseUrl = VITE_DEV_SERVER_URL || fallbackUrl;
+    const fullUrl = urlSuffix ? `${baseUrl}${urlSuffix}` : baseUrl;
+    let retries = 0;
+    const maxRetries = 10;
+    const tryLoad = () => {
+        if (win.isDestroyed())
+            return;
+        console.log(`Loading from ${fullUrl} (attempt ${retries + 1})`);
+        win.loadURL(fullUrl).catch((err) => {
+            retries++;
+            if (retries < maxRetries && !win.isDestroyed()) {
+                console.log(`[Main] Load failed (${err.message}), retrying in 500ms...`);
+                setTimeout(tryLoad, 500);
+            }
+            else {
+                console.error(`[Main] Failed to load ${fullUrl} after ${retries} attempts`);
+                if (!win.isDestroyed())
+                    win.show();
+            }
+        });
+    };
+    tryLoad();
+}
 function createWindow() {
     const win = new electron_1.BrowserWindow({
         title: 'Minty',
         icon: iconPath,
+        width: 1200,
+        height: 800,
         webPreferences: {
             preload: node_path_1.default.join(__dirname, 'preload.js'),
-            nodeIntegration: true,
+            nodeIntegration: false,
             contextIsolation: true,
         },
-        frame: true,
+        frame: false,
         show: false,
     });
     windows.add(win);
@@ -233,19 +292,20 @@ function createWindow() {
             }
         }
     });
-    if (VITE_DEV_SERVER_URL) {
-        win.loadURL(VITE_DEV_SERVER_URL);
+    // Log renderer crashes
+    win.webContents.on('render-process-gone', (_event, details) => {
+        console.error('[Main] Renderer process gone:', details.reason, details.exitCode);
+    });
+    win.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+        console.error('[Main] Page failed to load:', errorCode, errorDescription);
+    });
+    if (electron_1.app.isPackaged) {
+        win.loadFile(node_path_1.default.join(process.env.DIST || '', 'index.html'));
     }
     else {
-        // Fallback for dev environment without env var
-        if (!electron_1.app.isPackaged) {
-            const fallbackUrl = 'http://localhost:5173';
-            win.loadURL(fallbackUrl);
-            console.log('Loading from ' + fallbackUrl + ' (fallback)');
-        }
-        else {
-            win.loadFile(node_path_1.default.join(process.env.DIST || '', 'index.html'));
-        }
+        loadDevUrl(win);
+        // Open DevTools in dev mode so renderer errors are visible
+        win.webContents.openDevTools();
     }
     win.once('ready-to-show', () => {
         win.show();
@@ -276,6 +336,7 @@ function createWindow() {
             const bounds = win.getBounds();
             const isMaximized = win.isMaximized();
             if (windowTabIdsList && windowTabIdsList.length > 0) {
+                const activeId = windowActiveTabId.get(windowId) || '';
                 const tabs = [];
                 for (const tabId of windowTabIdsList) {
                     const cwd = tabDirectories.get(tabId);
@@ -285,7 +346,7 @@ function createWindow() {
                             id: tabId,
                             title: cwd.split('/').pop() || 'unknown',
                             cwd: cwd,
-                            isActive: false,
+                            isActive: tabId === activeId,
                             type: 'terminal'
                         });
                     }
@@ -301,11 +362,12 @@ function createWindow() {
                         isMaximized
                     },
                     tabs,
-                    activeTabId: ''
+                    activeTabId: activeId
                 }).catch(err => {
                     console.warn('[Main] Failed to save cache on window close:', err);
                 });
             }
+            windowActiveTabId.delete(windowId);
         }
         catch (error) {
             console.warn('[Main] Error saving window state on close:', error);
@@ -345,7 +407,14 @@ electron_1.ipcMain.on('window-close', (event) => {
 // Create new window handler
 electron_1.ipcMain.handle('create-new-window', async () => {
     try {
-        const newWin = createWindow(); // Use same function
+        const newWin = createWindow();
+        // Safety: force-show if ready-to-show never fires
+        setTimeout(() => {
+            if (!newWin.isDestroyed() && !newWin.isVisible()) {
+                console.warn('[Main] New window ready-to-show timeout — force-showing');
+                newWin.show();
+            }
+        }, 8000);
         return { success: true, windowId: newWin.id };
     }
     catch (error) {
@@ -355,11 +424,22 @@ electron_1.ipcMain.handle('create-new-window', async () => {
 // Create new tab handler
 electron_1.ipcMain.handle('create-new-tab', async (event) => {
     try {
-        const tabId = Date.now().toString();
+        const tabId = node_crypto_1.default.randomUUID();
         const homeDir = node_os_1.default.homedir();
         tabDirectories.set(tabId, homeDir);
         // Register window mapping
         tabWindows.set(tabId, event.sender.id);
+        // Register with windowTabIds for cache tracking
+        const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+            const windowId = win.id;
+            const ids = windowTabIds.get(windowId) || [];
+            if (!ids.includes(tabId)) {
+                ids.push(tabId);
+                windowTabIds.set(windowId, ids);
+                console.log('[Main] Auto-registered new tab', tabId, 'for window', windowId, '- total tabs:', ids.length);
+            }
+        }
         const shell = getDefaultShell();
         const env = buildEnv();
         const ptyProcess = pty.spawn(shell, [], {
@@ -370,23 +450,26 @@ electron_1.ipcMain.handle('create-new-tab', async (event) => {
             env: env
         });
         tabPtys.set(tabId, ptyProcess);
+        aiToolMonitor.startMonitoring(tabId, ptyProcess.pid);
         ptyProcess.onData((data) => {
             sendToWindow(tabId, 'pty-output', { tabId, data });
         });
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(tabId);
             sendToWindow(tabId, 'pty-exit', { tabId, exitCode });
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
         });
-        // Send tab-created event to renderer
-        event.sender.send('tab-created', tabId, homeDir, homeDir.split('/').pop() || 'home');
-        return { success: true, tabId, cwd: homeDir };
+        return { success: true, tabId, cwd: homeDir, title: homeDir.split('/').pop() || 'home' };
     }
     catch (error) {
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
-// Old window handlers removed
+// Get the number of open windows
+electron_1.ipcMain.handle('get-window-count', () => {
+    return electron_1.BrowserWindow.getAllWindows().length;
+});
 // Get home directory
 electron_1.ipcMain.handle('get-home-directory', () => {
     return node_os_1.default.homedir();
@@ -395,6 +478,20 @@ electron_1.ipcMain.handle('get-home-directory', () => {
 electron_1.ipcMain.handle('get-window-id', (event) => {
     const win = electron_1.BrowserWindow.fromWebContents(event.sender);
     return win ? win.id : null;
+});
+// Get current window bounds and state
+electron_1.ipcMain.handle('get-window-bounds', (event) => {
+    const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed())
+        return null;
+    const bounds = win.getBounds();
+    return {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        isMaximized: win.isMaximized()
+    };
 });
 // Get current working directory for a tab
 electron_1.ipcMain.handle('get-cwd', (_event, tabId) => {
@@ -406,13 +503,12 @@ electron_1.ipcMain.handle('query-cwd', async (_event, tabId) => {
     if (!ptyProcess) {
         return tabDirectories.get(tabId) || node_os_1.default.homedir();
     }
-    // For Linux: use /proc to read shell's cwd (completely invisible!)
-    if (process.platform === 'linux') {
-        try {
-            const pid = ptyProcess.pid;
-            if (pid) {
+    const pid = ptyProcess.pid;
+    if (pid) {
+        // Linux: use /proc to read shell's cwd (completely invisible)
+        if (process.platform === 'linux') {
+            try {
                 const fs = await Promise.resolve().then(() => __importStar(require('node:fs/promises')));
-                // Read /proc/[pid]/cwd symlink which points to current working directory
                 const cwd = await fs.readlink(`/proc/${pid}/cwd`);
                 if (cwd && cwd !== tabDirectories.get(tabId)) {
                     console.log('[Main] Directory changed for tab', tabId, ':', cwd);
@@ -420,10 +516,34 @@ electron_1.ipcMain.handle('query-cwd', async (_event, tabId) => {
                 }
                 return cwd;
             }
+            catch (error) {
+                console.warn('[Main] Failed to read /proc for tab', tabId, ':', error);
+            }
         }
-        catch (error) {
-            // Fallback to tracked directory if /proc reading fails
-            console.warn('[Main] Failed to read /proc for tab', tabId, ':', error);
+        // macOS: use lsof to find the cwd of the process
+        if (process.platform === 'darwin') {
+            try {
+                const cp = await Promise.resolve().then(() => __importStar(require('node:child_process')));
+                const cwd = await new Promise((resolve) => {
+                    cp.exec(`lsof -p ${pid} -Fn | grep '^fcwd$' -A1 | grep '^n' | cut -c2-`, { timeout: 2000 }, (err, stdout) => {
+                        if (err || !stdout.trim()) {
+                            resolve(null);
+                        }
+                        else {
+                            resolve(stdout.trim());
+                        }
+                    });
+                });
+                if (cwd && cwd !== tabDirectories.get(tabId)) {
+                    console.log('[Main] Directory changed for tab', tabId, ':', cwd);
+                    tabDirectories.set(tabId, cwd);
+                }
+                if (cwd)
+                    return cwd;
+            }
+            catch (error) {
+                console.warn('[Main] Failed to query cwd via lsof for tab', tabId, ':', error);
+            }
         }
     }
     // Fallback: return tracked directory
@@ -434,7 +554,97 @@ electron_1.ipcMain.handle('set-cwd', (_event, tabId, cwd) => {
     tabDirectories.set(tabId, cwd);
     return cwd;
 });
-// Create persistent PTY session for a tab
+// Select directory dialog
+electron_1.ipcMain.handle('select-directory', async (event) => {
+    const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+    if (!win)
+        return null;
+    const result = await electron_1.dialog.showOpenDialog(win, {
+        properties: ['openDirectory', 'createDirectory'],
+        title: 'Select Directory',
+    });
+    if (result.canceled || result.filePaths.length === 0)
+        return null;
+    return result.filePaths[0];
+});
+// List directory contents
+electron_1.ipcMain.handle('list-directory', async (_event, dirPath, options) => {
+    try {
+        const resolvedPath = dirPath.startsWith('~')
+            ? node_path_1.default.join(node_os_1.default.homedir(), dirPath.slice(1))
+            : dirPath;
+        const dirents = await promises_1.default.readdir(resolvedPath, { withFileTypes: true });
+        const entries = await Promise.all(dirents
+            .filter((dirent) => options?.showHidden || !dirent.name.startsWith('.'))
+            .map(async (dirent) => {
+            const fullPath = node_path_1.default.join(resolvedPath, dirent.name);
+            let size = 0;
+            let modifiedAt = 0;
+            try {
+                const stat = await promises_1.default.stat(fullPath);
+                size = stat.size;
+                modifiedAt = stat.mtimeMs;
+            }
+            catch {
+                // stat may fail for broken symlinks
+            }
+            return {
+                name: dirent.name,
+                path: fullPath,
+                isDirectory: dirent.isDirectory(),
+                isSymlink: dirent.isSymbolicLink(),
+                size,
+                modifiedAt,
+            };
+        }));
+        return { success: true, path: resolvedPath, entries };
+    }
+    catch (error) {
+        return { success: false, entries: [], error: error.message };
+    }
+});
+// Read file contents for the code editor
+electron_1.ipcMain.handle('read-file', async (_event, filePath) => {
+    try {
+        const resolvedPath = filePath.startsWith('~')
+            ? node_path_1.default.join(node_os_1.default.homedir(), filePath.slice(1))
+            : filePath;
+        // Check file size first (reject files > 5MB)
+        const stat = await promises_1.default.stat(resolvedPath);
+        if (stat.size > 5 * 1024 * 1024) {
+            return { success: false, error: 'File too large (>5MB)', path: resolvedPath };
+        }
+        // Read first 8KB to detect binary files
+        const fileHandle = await promises_1.default.open(resolvedPath, 'r');
+        const checkBuffer = Buffer.alloc(Math.min(8192, stat.size));
+        await fileHandle.read(checkBuffer, 0, checkBuffer.length, 0);
+        await fileHandle.close();
+        // Check for null bytes (binary indicator)
+        for (let i = 0; i < checkBuffer.length; i++) {
+            if (checkBuffer[i] === 0) {
+                return { success: false, error: 'Binary file cannot be opened in editor', path: resolvedPath };
+            }
+        }
+        const content = await promises_1.default.readFile(resolvedPath, 'utf-8');
+        return { success: true, content, path: resolvedPath };
+    }
+    catch (error) {
+        return { success: false, error: error.message, path: filePath };
+    }
+});
+// Write file contents from the code editor
+electron_1.ipcMain.handle('write-file', async (_event, filePath, content) => {
+    try {
+        const resolvedPath = filePath.startsWith('~')
+            ? node_path_1.default.join(node_os_1.default.homedir(), filePath.slice(1))
+            : filePath;
+        await promises_1.default.writeFile(resolvedPath, content, 'utf-8');
+        return { success: true };
+    }
+    catch (error) {
+        return { success: false, error: error.message };
+    }
+});
 // Create persistent PTY session for a tab
 electron_1.ipcMain.handle('create-pty-session', (event, tabId, cwd) => {
     // Kill existing PTY if any
@@ -448,6 +658,17 @@ electron_1.ipcMain.handle('create-pty-session', (event, tabId, cwd) => {
     tabDirectories.set(tabId, workingDir);
     // Register window
     tabWindows.set(tabId, event.sender.id);
+    // Register with windowTabIds for cache tracking
+    const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        const windowId = win.id;
+        const ids = windowTabIds.get(windowId) || [];
+        if (!ids.includes(tabId)) {
+            ids.push(tabId);
+            windowTabIds.set(windowId, ids);
+            console.log('[Main] Auto-registered pty-session tab', tabId, 'for window', windowId, '- total tabs:', ids.length);
+        }
+    }
     const shell = getDefaultShell();
     const env = buildEnv();
     try {
@@ -459,12 +680,14 @@ electron_1.ipcMain.handle('create-pty-session', (event, tabId, cwd) => {
             env: env
         });
         tabPtys.set(tabId, ptyProcess);
+        aiToolMonitor.startMonitoring(tabId, ptyProcess.pid);
         // Stream output to renderer
         ptyProcess.onData((data) => {
             sendToWindow(tabId, 'pty-output', { tabId, data });
         });
         // Handle PTY exit
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(tabId);
             sendToWindow(tabId, 'pty-exit', { tabId, exitCode });
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
@@ -494,7 +717,6 @@ electron_1.ipcMain.handle('create-pty-session', (event, tabId, cwd) => {
         };
     }
 });
-// Initialize a new tab (legacy support + creates PTY)
 // Initialize a new tab (legacy support + creates PTY)
 electron_1.ipcMain.handle('init-tab', (event, tabId, cwd) => {
     // Use provided cwd or default to home directory
@@ -531,10 +753,12 @@ electron_1.ipcMain.handle('init-tab', (event, tabId, cwd) => {
             env: env
         });
         tabPtys.set(tabId, ptyProcess);
+        aiToolMonitor.startMonitoring(tabId, ptyProcess.pid);
         ptyProcess.onData((data) => {
             sendToWindow(tabId, 'pty-output', { tabId, data });
         });
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(tabId);
             sendToWindow(tabId, 'pty-exit', { tabId, exitCode });
             tabPtys.delete(tabId);
             tabWindows.delete(tabId);
@@ -564,6 +788,7 @@ electron_1.ipcMain.handle('init-tab', (event, tabId, cwd) => {
 });
 // Remove tab and cleanup PTY
 electron_1.ipcMain.handle('remove-tab', (event, tabId) => {
+    aiToolMonitor.stopMonitoring(tabId);
     const ptyProcess = tabPtys.get(tabId);
     if (ptyProcess) {
         ptyProcess.kill();
@@ -633,6 +858,29 @@ electron_1.ipcMain.handle('send-signal', (_event, tabId, signal) => {
     }
     return { success: false };
 });
+// AI tool monitor settings
+electron_1.ipcMain.handle('ai-tool-monitor-set-enabled', (_event, enabled) => {
+    aiToolMonitor.setEnabled(enabled);
+    return { success: true };
+});
+electron_1.ipcMain.handle('ai-tool-monitor-get-enabled', () => {
+    return aiToolMonitor.isEnabled();
+});
+// Test handler: fire a fake AI tool completion event to verify toast pipeline
+electron_1.ipcMain.handle('ai-tool-monitor-test', (event) => {
+    const testEvent = {
+        tabId: 'test',
+        toolName: 'claude',
+        displayName: 'Claude Code',
+        durationMs: 45000,
+    };
+    console.log('[Main] Firing test AI tool completion event');
+    const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) {
+        win.webContents.send('ai-tool-completed', testEvent);
+    }
+    return { success: true };
+});
 // Execute command (legacy mode - non-interactive, returns when complete)
 electron_1.ipcMain.handle('execute-command', async (_event, command, tabId) => {
     const cwd = tabDirectories.get(tabId) || node_os_1.default.homedir();
@@ -646,15 +894,10 @@ electron_1.ipcMain.handle('execute-command', async (_event, command, tabId) => {
             newPath = node_os_1.default.homedir();
         }
         else if (targetPath === '-') {
-            newPath = cwd;
+            newPath = tabPreviousDirectories.get(tabId) || cwd;
         }
-        else if (targetPath.startsWith('~')) {
-            if (targetPath === '~' || targetPath === '~/') {
-                newPath = node_os_1.default.homedir();
-            }
-            else {
-                newPath = node_path_1.default.join(node_os_1.default.homedir(), targetPath.slice(2));
-            }
+        else if (targetPath.startsWith('~/')) {
+            newPath = node_path_1.default.join(node_os_1.default.homedir(), targetPath.slice(2));
         }
         else if (node_path_1.default.isAbsolute(targetPath)) {
             newPath = targetPath;
@@ -673,6 +916,7 @@ electron_1.ipcMain.handle('execute-command', async (_event, command, tabId) => {
                     cwd: cwd
                 };
             }
+            tabPreviousDirectories.set(tabId, cwd);
             tabDirectories.set(tabId, newPath);
             return {
                 success: true,
@@ -795,6 +1039,92 @@ electron_1.ipcMain.handle('get-system-info', () => {
         tempDir: node_os_1.default.tmpdir()
     };
 });
+// Track previous CPU times for delta-based usage calculation
+let prevCpuIdle = 0;
+let prevCpuTotal = 0;
+// Get real-time system stats (battery, wifi, cpu, memory)
+electron_1.ipcMain.handle('get-system-stats', async () => {
+    // CPU usage (delta between calls)
+    const cpus = node_os_1.default.cpus();
+    let idle = 0;
+    let total = 0;
+    for (const cpu of cpus) {
+        idle += cpu.times.idle;
+        total += cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.idle + cpu.times.irq;
+    }
+    let cpuUsage = 0;
+    if (prevCpuTotal > 0) {
+        const idleDiff = idle - prevCpuIdle;
+        const totalDiff = total - prevCpuTotal;
+        cpuUsage = totalDiff > 0 ? Math.round((1 - idleDiff / totalDiff) * 100) : 0;
+    }
+    prevCpuIdle = idle;
+    prevCpuTotal = total;
+    // Memory
+    const totalMem = node_os_1.default.totalmem();
+    const freeMem = node_os_1.default.freemem();
+    const memoryUsage = Math.round(((totalMem - freeMem) / totalMem) * 100);
+    // Battery (Linux: /sys/class/power_supply/BAT*)
+    let battery = { level: 100, charging: false, available: false };
+    for (const batName of ['BAT0', 'BAT1', 'BAT2', 'BATT', 'battery']) {
+        try {
+            const batPath = `/sys/class/power_supply/${batName}`;
+            const capacity = await promises_1.default.readFile(`${batPath}/capacity`, 'utf-8');
+            const status = await promises_1.default.readFile(`${batPath}/status`, 'utf-8');
+            battery = {
+                level: parseInt(capacity.trim(), 10),
+                charging: status.trim() === 'Charging' || status.trim() === 'Full',
+                available: true
+            };
+            break;
+        }
+        catch {
+            // Try next battery name
+        }
+    }
+    // WiFi signal (Linux: /proc/net/wireless)
+    let wifi = { connected: true, quality: 0, strength: 'unknown', available: false };
+    try {
+        const wireless = await promises_1.default.readFile('/proc/net/wireless', 'utf-8');
+        const lines = wireless.trim().split('\n');
+        if (lines.length > 2) {
+            const dataLine = lines[2].trim();
+            const parts = dataLine.split(/\s+/);
+            const linkQuality = parseFloat(parts[2]); // 0-70 typically
+            const qualityPercent = Math.min(100, Math.round((linkQuality / 70) * 100));
+            wifi = {
+                connected: true,
+                quality: qualityPercent,
+                strength: qualityPercent > 65 ? 'strong' : qualityPercent > 35 ? 'moderate' : 'weak',
+                available: true
+            };
+        }
+    }
+    catch {
+        // No wireless interface or not on Linux — fallback
+    }
+    // If no wifi data from /proc, check basic network connectivity
+    if (!wifi.available) {
+        try {
+            const { execSync } = await Promise.resolve().then(() => __importStar(require('node:child_process')));
+            const result = execSync('nmcli -t -f SIGNAL,ACTIVE dev wifi', { timeout: 2000 }).toString();
+            const activeLine = result.split('\n').find(l => l.endsWith(':yes'));
+            if (activeLine) {
+                const signal = parseInt(activeLine.split(':')[0], 10);
+                wifi = {
+                    connected: true,
+                    quality: signal,
+                    strength: signal > 65 ? 'strong' : signal > 35 ? 'moderate' : 'weak',
+                    available: true
+                };
+            }
+        }
+        catch {
+            // nmcli not available or no wifi
+        }
+    }
+    return { cpuUsage, memoryUsage, battery, wifi };
+});
 // Get current tabs for saving
 electron_1.ipcMain.handle('get-current-tabs', () => {
     const tabs = [];
@@ -820,13 +1150,23 @@ electron_1.ipcMain.handle('save-to-library', async (_event, _libraryItem) => {
     }
 });
 // Open tab with specific directory
-// Open tab with specific directory
 electron_1.ipcMain.handle('open-tab-with-directory', async (event, cwd, title) => {
     try {
-        const newId = Date.now().toString();
+        const newId = node_crypto_1.default.randomUUID();
         tabDirectories.set(newId, cwd);
         // Register window
         tabWindows.set(newId, event.sender.id);
+        // Register with windowTabIds for cache tracking
+        const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+            const windowId = win.id;
+            const ids = windowTabIds.get(windowId) || [];
+            if (!ids.includes(newId)) {
+                ids.push(newId);
+                windowTabIds.set(windowId, ids);
+                console.log('[Main] Auto-registered directory tab', newId, 'for window', windowId, '- total tabs:', ids.length);
+            }
+        }
         const shell = getDefaultShell();
         const env = buildEnv();
         const ptyProcess = pty.spawn(shell, [], {
@@ -837,10 +1177,12 @@ electron_1.ipcMain.handle('open-tab-with-directory', async (event, cwd, title) =
             env: env
         });
         tabPtys.set(newId, ptyProcess);
+        aiToolMonitor.startMonitoring(newId, ptyProcess.pid);
         ptyProcess.onData((data) => {
             sendToWindow(newId, 'pty-output', { tabId: newId, data });
         });
         ptyProcess.onExit(({ exitCode }) => {
+            aiToolMonitor.stopMonitoring(newId);
             sendToWindow(newId, 'pty-exit', { tabId: newId, exitCode });
             tabPtys.delete(newId);
             tabWindows.delete(newId);
@@ -1076,11 +1418,16 @@ electron_1.ipcMain.handle('cache-get-state', async () => {
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
-electron_1.ipcMain.handle('cache-save', async (_event, entry) => {
+electron_1.ipcMain.handle('cache-save', async (event, entry) => {
     try {
         const settings = cacheManager_1.cacheManager.getSettings();
         if (!settings.enabled) {
             return { success: true, skipped: true };
+        }
+        // Override windowId with authoritative value from sender
+        const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+        if (win) {
+            entry.windowId = win.id;
         }
         (0, cacheWorker_1.scheduleCacheSave)(entry);
         return { success: true };
@@ -1145,8 +1492,18 @@ electron_1.ipcMain.handle('cache-clear', async (_event, windowId) => {
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
-electron_1.ipcMain.handle('cache-register-tab', async (_event, windowId, tabId) => {
+electron_1.ipcMain.handle('set-active-tab', async (event, tabId) => {
+    const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+    if (win) {
+        windowActiveTabId.set(win.id, tabId);
+    }
+    return { success: true };
+});
+electron_1.ipcMain.handle('cache-register-tab', async (event, _windowId, tabId) => {
     try {
+        // Derive window ID from event.sender (authoritative) instead of trusting renderer
+        const win = electron_1.BrowserWindow.fromWebContents(event.sender);
+        const windowId = win ? win.id : _windowId;
         const ids = windowTabIds.get(windowId) || [];
         if (!ids.includes(tabId)) {
             ids.push(tabId);
@@ -1178,6 +1535,102 @@ electron_1.ipcMain.handle('cache-unregister-tab', async (_event, windowId, tabId
         return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
 });
+// ── AI Settings IPC Handlers ──────────────────────────────────────────
+electron_1.ipcMain.handle('ai-get-settings', async () => {
+    return getAiManager().loadSettings();
+});
+electron_1.ipcMain.handle('ai-set-settings', async (_event, settings) => {
+    await getAiManager().saveSettings(settings);
+    return { success: true };
+});
+electron_1.ipcMain.handle('ai-test-connection', async (_event, settings) => {
+    return getAiManager().testConnection(settings);
+});
+electron_1.ipcMain.handle('ai-enhance-command', async (_event, request) => {
+    return getAiManager().enhanceCommand(request.command);
+});
+// ── Git IPC Handlers ─────────────────────────────────────────────────
+electron_1.ipcMain.handle('git-is-repo', async (_event, cwd) => {
+    return getGitManager().isGitRepo(cwd);
+});
+electron_1.ipcMain.handle('git-init', async (_event, cwd) => {
+    return getGitManager().initRepo(cwd);
+});
+electron_1.ipcMain.handle('git-status', async (_event, cwd) => {
+    return getGitManager().getStatus(cwd);
+});
+electron_1.ipcMain.handle('git-log', async (_event, cwd, limit) => {
+    return getGitManager().getLog(cwd, limit);
+});
+electron_1.ipcMain.handle('git-diff', async (_event, cwd, staged) => {
+    return getGitManager().getDiff(cwd, staged);
+});
+electron_1.ipcMain.handle('git-diff-file', async (_event, cwd, file, staged) => {
+    return getGitManager().getFileDiff(cwd, file, staged);
+});
+electron_1.ipcMain.handle('git-stage', async (_event, cwd, files) => {
+    return getGitManager().stageFiles(cwd, files);
+});
+electron_1.ipcMain.handle('git-unstage', async (_event, cwd, files) => {
+    return getGitManager().unstageFiles(cwd, files);
+});
+electron_1.ipcMain.handle('git-stage-all', async (_event, cwd) => {
+    return getGitManager().stageAll(cwd);
+});
+electron_1.ipcMain.handle('git-commit', async (_event, cwd, message) => {
+    return getGitManager().commit(cwd, message);
+});
+electron_1.ipcMain.handle('git-push', async (_event, cwd, remote, branch) => {
+    return getGitManager().push(cwd, remote, branch);
+});
+electron_1.ipcMain.handle('git-pull', async (_event, cwd, remote, branch) => {
+    return getGitManager().pull(cwd, remote, branch);
+});
+electron_1.ipcMain.handle('git-branches', async (_event, cwd) => {
+    return getGitManager().getBranches(cwd);
+});
+electron_1.ipcMain.handle('git-branch-create', async (_event, cwd, name) => {
+    return getGitManager().createBranch(cwd, name);
+});
+electron_1.ipcMain.handle('git-branch-switch', async (_event, cwd, name) => {
+    return getGitManager().switchBranch(cwd, name);
+});
+electron_1.ipcMain.handle('git-branch-delete', async (_event, cwd, name, force) => {
+    return getGitManager().deleteBranch(cwd, name, force);
+});
+electron_1.ipcMain.handle('git-branch-merge', async (_event, cwd, branch) => {
+    return getGitManager().mergeBranch(cwd, branch);
+});
+electron_1.ipcMain.handle('git-remotes', async (_event, cwd) => {
+    return getGitManager().getRemotes(cwd);
+});
+electron_1.ipcMain.handle('git-remote-add', async (_event, cwd, name, url) => {
+    return getGitManager().addRemote(cwd, name, url);
+});
+electron_1.ipcMain.handle('git-remote-remove', async (_event, cwd, name) => {
+    return getGitManager().removeRemote(cwd, name);
+});
+electron_1.ipcMain.handle('git-remote-set-url', async (_event, cwd, name, url) => {
+    return getGitManager().setRemoteUrl(cwd, name, url);
+});
+electron_1.ipcMain.handle('git-clone', async (_event, url, targetDir, options) => {
+    return getGitManager().clone(url, targetDir, options);
+});
+electron_1.ipcMain.handle('github-connect-pat', async (_event, token) => {
+    return getGitManager().saveGitHubAuth(token, 'pat');
+});
+electron_1.ipcMain.handle('github-disconnect', async () => {
+    return getGitManager().disconnectGitHub();
+});
+electron_1.ipcMain.handle('github-get-auth', async () => {
+    return getGitManager().loadGitHubAuth();
+});
+electron_1.ipcMain.handle('github-list-repos', async (_event, page, perPage) => {
+    return getGitManager().listGitHubRepos(page, perPage);
+});
+electron_1.ipcMain.handle('github-search-repos', async (_event, query) => {
+    return getGitManager().searchGitHubRepos(query);
+});
 // Create a new Minty window with specific tabs
 electron_1.ipcMain.handle('create-window-with-tabs', async (_event, tabs) => {
     console.log('[IPC] create-window-with-tabs called with tabs:', tabs);
@@ -1187,7 +1640,7 @@ electron_1.ipcMain.handle('create-window-with-tabs', async (_event, tabs) => {
             icon: iconPath,
             webPreferences: {
                 preload: node_path_1.default.join(__dirname, 'preload.js'),
-                nodeIntegration: true,
+                nodeIntegration: false,
                 contextIsolation: true,
             },
             frame: false,
@@ -1196,19 +1649,13 @@ electron_1.ipcMain.handle('create-window-with-tabs', async (_event, tabs) => {
             height: 800,
         });
         console.log('[IPC] New window created, loading URL...');
-        if (VITE_DEV_SERVER_URL) {
-            newWin.loadURL(`${VITE_DEV_SERVER_URL}?libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`);
+        if (electron_1.app.isPackaged) {
+            newWin.loadFile(node_path_1.default.join(process.env.DIST || '', 'index.html'), {
+                hash: `libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`
+            });
         }
         else {
-            if (!electron_1.app.isPackaged) {
-                const fallbackUrl = 'http://localhost:5174';
-                newWin.loadURL(`${fallbackUrl}?libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`);
-            }
-            else {
-                newWin.loadFile(node_path_1.default.join(process.env.DIST || '', 'index.html'), {
-                    hash: `libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`
-                });
-            }
+            loadDevUrl(newWin, `?libraryTabs=${encodeURIComponent(JSON.stringify(tabs))}`);
         }
         const loadHandler = () => {
             console.log('[IPC] New window loaded, sending tabs data');
@@ -1261,6 +1708,7 @@ electron_1.ipcMain.handle('create-window-with-tabs', async (_event, tabs) => {
                 const bounds = newWin.getBounds();
                 const isMaximized = newWin.isMaximized();
                 if (windowTabIdsList.length > 0) {
+                    const activeId = windowActiveTabId.get(windowId) || '';
                     const cacheTabs = [];
                     for (const tabId of windowTabIdsList) {
                         const cwd = tabDirectories.get(tabId);
@@ -1269,7 +1717,7 @@ electron_1.ipcMain.handle('create-window-with-tabs', async (_event, tabs) => {
                                 id: tabId,
                                 title: cwd.split('/').pop() || 'unknown',
                                 cwd: cwd,
-                                isActive: false,
+                                isActive: tabId === activeId,
                                 type: 'terminal'
                             });
                         }
@@ -1285,11 +1733,12 @@ electron_1.ipcMain.handle('create-window-with-tabs', async (_event, tabs) => {
                             isMaximized
                         },
                         tabs: cacheTabs,
-                        activeTabId: ''
+                        activeTabId: activeId
                     }).catch(err => {
                         console.warn('[Main] Failed to save cache on window close:', err);
                     });
                 }
+                windowActiveTabId.delete(windowId);
             }
             catch (error) {
                 console.warn('[Main] Error saving window state on close:', error);
@@ -1314,55 +1763,20 @@ electron_1.app.on('window-all-closed', async () => {
         ptyProcess.kill();
     });
     tabPtys.clear();
-    const entries = [];
-    for (const win of windows) {
-        // Skip destroyed windows
-        if (win.isDestroyed()) {
-            continue;
-        }
-        try {
-            const windowId = win.id;
-            const windowTabIdsList = windowTabIds.get(windowId) || [];
-            const bounds = win.getBounds();
-            const isMaximized = win.isMaximized();
-            if (windowTabIdsList.length > 0) {
-                const cacheTabs = [];
-                for (const tabId of windowTabIdsList) {
-                    const cwd = tabDirectories.get(tabId);
-                    if (cwd) {
-                        cacheTabs.push({
-                            id: tabId,
-                            title: cwd.split('/').pop() || 'unknown',
-                            cwd: cwd,
-                            isActive: false,
-                            type: 'terminal'
-                        });
-                    }
-                }
-                entries.push({
-                    windowId,
-                    timestamp: Date.now(),
-                    windowState: {
-                        x: bounds.x,
-                        y: bounds.y,
-                        width: bounds.width,
-                        height: bounds.height,
-                        isMaximized
-                    },
-                    tabs: cacheTabs,
-                    activeTabId: ''
-                });
-            }
-        }
-        catch (error) {
-            // Window was destroyed while processing
-            console.warn('[Main] Window destroyed during save:', error);
-        }
+    // The 'close' event on each window already called forceSave() which stored
+    // entries in cacheManager's memory via updateEntry(). By the time
+    // 'window-all-closed' fires, the 'closed' event has already cleared
+    // windowTabIds and windows, so we can't rebuild entries from those maps.
+    // Instead, just flush the in-memory cache to disk.
+    try {
+        await cacheManager_1.cacheManager.saveCache();
+        console.log('[Main] Cache flushed to disk on app close');
     }
-    await (0, cacheWorker_1.saveAllWindows)(entries).catch(err => {
-        console.warn('[Main] Failed to save all windows cache:', err);
-    });
+    catch (err) {
+        console.warn('[Main] Failed to flush cache on app close:', err);
+    }
     windowTabIds.clear();
+    windowActiveTabId.clear();
     if (process.platform !== 'darwin') {
         electron_1.app.quit();
     }
@@ -1377,9 +1791,29 @@ electron_1.app.whenReady().then(async () => {
     await cacheManager_1.cacheManager.initialize();
     const splash = createSplashWindow();
     const mainWin = createWindow();
+    // Close splash when main window is ready, with a minimum 1.5s display time
+    const splashStart = Date.now();
+    let shown = false;
+    const showMainWindow = () => {
+        if (shown)
+            return;
+        shown = true;
+        const elapsed = Date.now() - splashStart;
+        const remaining = Math.max(0, 1500 - elapsed);
+        setTimeout(() => {
+            if (!splash.isDestroyed())
+                splash.close();
+            if (!mainWin.isDestroyed() && !mainWin.isVisible())
+                mainWin.show();
+        }, remaining);
+    };
+    mainWin.once('ready-to-show', showMainWindow);
+    // Safety: if ready-to-show never fires, force-show after 8 seconds
     setTimeout(() => {
-        splash.close();
-        mainWin?.show();
-    }, 3000);
+        if (!shown) {
+            console.warn('[Main] ready-to-show timeout — force-showing window');
+            showMainWindow();
+        }
+    }, 8000);
 });
 //# sourceMappingURL=main.js.map
